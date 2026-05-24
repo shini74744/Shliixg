@@ -3,7 +3,7 @@ set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15.1-auto-single-fix-debian-alpine"
+export SCRIPT_VERSION="15.2-install-timeout-fix-debian-alpine"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
@@ -18,6 +18,21 @@ export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
 export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
 # 默认采用自动策略：单协议走 single，增加节点/重协议自动走 multi；需要强保连通时可执行 continuity-mode。
 export SB_STABILITY_MODE="${SB_STABILITY_MODE:-auto}"
+# 安装/下载防卡死超时：避免 apt/apk/wget/curl 在网络异常、包管理锁、GitHub 连接异常时无限等待。
+export SB_INSTALL_TIMEOUT="${SB_INSTALL_TIMEOUT:-180}"
+export SB_DOWNLOAD_TIMEOUT="${SB_DOWNLOAD_TIMEOUT:-90}"
+export SB_APT_LOCK_TIMEOUT="${SB_APT_LOCK_TIMEOUT:-30}"
+
+_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 
 # --- 核心工具函数 ---
 
@@ -293,15 +308,15 @@ _pkg_install() {
     if command -v apk >/dev/null 2>&1; then
         # Alpine 包名适配
         pkgs="${pkgs/cron/dcron}"
-        apk add --no-cache $pkgs >/dev/null 2>&1
+        _with_timeout "$SB_INSTALL_TIMEOUT" apk add --no-cache $pkgs >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
         # Debian / Ubuntu
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-            apt-get update -qq >/dev/null 2>&1
+            _with_timeout "$SB_INSTALL_TIMEOUT" apt-get update -qq >/dev/null 2>&1
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive _with_timeout "$SB_INSTALL_TIMEOUT" apt-get install -y -o Dpkg::Lock::Timeout="$SB_APT_LOCK_TIMEOUT" $pkgs >/dev/null 2>&1 || {
+            _with_timeout "$SB_INSTALL_TIMEOUT" apt-get update -qq >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive _with_timeout "$SB_INSTALL_TIMEOUT" apt-get install -y -o Dpkg::Lock::Timeout="$SB_APT_LOCK_TIMEOUT" $pkgs >/dev/null 2>&1
         }
     else
         _error "未检测到受支持的包管理器。仅支持 Debian/Ubuntu 的 apt-get 或 Alpine 的 apk。"
@@ -827,7 +842,7 @@ _refresh_dynamic_runtime_limits() {
 
 # 安装阶段会产生较多文件缓存，低内存容器中尽力释放；失败不影响主流程
 _release_install_cache() {
-    sync 2>/dev/null || true
+    _with_timeout 5 sync 2>/dev/null || true
     if [ -w /proc/sys/vm/drop_caches ]; then
         if { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null; then
             _info "已尝试释放安装产生的文件缓存。"
@@ -842,7 +857,7 @@ _install_yq() {
         _info "安装 yq..."
         local arch=$(uname -m)
         case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        if ! wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
+        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
             rm -f "$YQ_BINARY"
             _error "yq 下载失败或文件为空"
             return 1
@@ -869,7 +884,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
+export -f _with_timeout _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
 
 export DEFAULT_SNI="$(_get_random_sni)"
 export MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
@@ -977,7 +992,7 @@ _install_sing_box() {
     
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local release_info=$(curl -s "$api_url")
+    local release_info=$(_with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null || true)
     local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
 
     if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
@@ -986,7 +1001,7 @@ _install_sing_box() {
     archive_path="${temp_dir}/sing-box.tar.gz"
 
     _info "正在下载 sing-box 安装包..."
-    if ! wget -qO "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
+    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
         _error "下载失败或文件为空: $download_url"
         rm -rf "$temp_dir"
         return 1
@@ -1048,7 +1063,7 @@ _install_cloudflared() {
     
     local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch_tag}"
     
-    if ! wget -qO "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
+    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
         rm -f "${CLOUDFLARED_BIN}"
         _error "cloudflared 下载失败或文件为空!"
         return 1
