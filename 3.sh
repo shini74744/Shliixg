@@ -374,7 +374,7 @@ _detect_init_system
 
 export -f _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name
 
-DEFAULT_SNI="$(_get_random_sni)"
+export DEFAULT_SNI="$(_get_random_sni)"
 server_ip=""
 BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
@@ -3372,7 +3372,7 @@ _view_nodes() {
                 # [资源优化] 合并4次jq为1次
                 local _vless_fields
                 # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底随机 SNI
-                _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.transport.path // "")] | @tsv')
+                _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // env.DEFAULT_SNI), (.transport.path // "")] | @tsv')
                 IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn ws_path <<< "$_vless_fields"
                 
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
@@ -3453,7 +3453,7 @@ _view_nodes() {
                 # [资源优化] 合并2次jq为1次
                 local pw sn
                 # [加固] 允许 server_name 回溯
-                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.amd.com")] | @tsv')"
+                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // env.DEFAULT_SNI)] | @tsv')"
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
@@ -4395,21 +4395,65 @@ replacements = [
 for pat, rep in replacements:
     text = re.sub(pat, rep, text)
 
-# 3) 把提示文案中的固定默认值改成“回车随机”。
-for old in ['默认: www.amd.com', '默认：www.amd.com', '默认 www.amd.com', '[默认: www.amd.com]', '[默认：www.amd.com]', '(默认: www.amd.com)', '(默认：www.amd.com)']:
-    text = text.replace(old, old.replace('默认: www.amd.com','回车随机').replace('默认：www.amd.com','回车随机').replace('默认 www.amd.com','回车随机').replace('[回车随机]','[回车随机]').replace('(回车随机)','(回车随机)'))
-text = text.replace('www.amd.com):', '回车随机):')
-text = text.replace('www.amd.com]:', '回车随机]:')
+# 2.1) 更广泛处理所有“选择/输入 SNI 域名”时的固定 www.amd.com 默认值。
+# 覆盖示例：中转机入口 SNI、Reality SNI、伪装域名、server_name 等。
+text = re.sub(r'(\$\{[A-Za-z_][A-Za-z0-9_]*:-)www\.amd\.com(\})', r'\1$(_get_random_sni)\2', text)
+text = re.sub(r'((?:local\s+)?[A-Za-z_][A-Za-z0-9_]*(?:sni|SNI|server_name|SERVER_NAME|domain|DOMAIN)[A-Za-z0-9_]*\s*=\s*)"www\.amd\.com"', r'\1"$(_get_random_sni)"', text)
+text = re.sub(r"((?:local\s+)?[A-Za-z_][A-Za-z0-9_]*(?:sni|SNI|server_name|SERVER_NAME|domain|DOMAIN)[A-Za-z0-9_]*\s*=\s*)'www\.amd\.com'", r"\1'$(_get_random_sni)'", text)
 
-# 4) 定点修复 read 后固定默认值的常见结构。
+# read -p 后一行/两行把空输入固定成 www.amd.com 的情况，变量名不再限制为少数几个。
 text = re.sub(
-    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+(custom_sni|input_sni|sni|server_name)\s*\n\s*\[\[\s+-z\s+"\$\2"\s+\]\]\s*&&\s*\2=)"www\.amd\.com"',
+    r'(read\s+-p\s+"[^"]*(?:SNI|sni|伪装域名|域名)[^"]*"\s+([A-Za-z_][A-Za-z0-9_]*)\s*\n\s*(?:\[\[|\[)\s+-z\s+"\$\2"\s+(?:\]\]|\])\s*&&\s*\2=)"www\.amd\.com"',
     r'\1"$(_get_random_sni)"',
     text,
     flags=re.M,
 )
 text = re.sub(
-    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+(custom_sni|input_sni|sni|server_name)\s*\n\s*\2=\$\{\2:-)www\.amd\.com(\})',
+    r'(read\s+-p\s+"[^"]*(?:SNI|sni|伪装域名|域名)[^"]*"\s+([A-Za-z_][A-Za-z0-9_]*)\s*\n\s*\2=\$\{\2:-)www\.amd\.com(\})',
+    r'\1$(_get_random_sni)\3',
+    text,
+    flags=re.M,
+)
+
+# 让 DEFAULT_SNI 在子脚本内部也是每次进入时随机，而不是继承固定值。
+if 'export DEFAULT_SNI="$(_get_random_sni)"' not in text:
+    text = text.replace('# [XRAY_RANDOM_SNI_HELPER]', '# [XRAY_RANDOM_SNI_HELPER]', 1)
+# 注意：下面会在 helper 函数后补一行 export DEFAULT_SNI。
+text = re.sub(r'(_get_random_sni\(\) \{.*?^\})', r'\1\nexport DEFAULT_SNI="$(_get_random_sni)"', text, count=1, flags=re.S | re.M)
+
+# 3) 把提示文案中的固定默认值改成“回车随机”。
+prompt_replacements = {
+    '默认: www.amd.com': '回车随机',
+    '默认：www.amd.com': '回车随机',
+    '默认 www.amd.com': '回车随机',
+    '回车默认 www.amd.com': '回车随机',
+    '回车默认: www.amd.com': '回车随机',
+    '回车默认：www.amd.com': '回车随机',
+    '[默认: www.amd.com]': '[回车随机]',
+    '[默认：www.amd.com]': '[回车随机]',
+    '[默认 www.amd.com]': '[回车随机]',
+    '[回车默认 www.amd.com]': '[回车随机]',
+    '(默认: www.amd.com)': '(回车随机)',
+    '(默认：www.amd.com)': '(回车随机)',
+    '(默认 www.amd.com)': '(回车随机)',
+    '(回车默认 www.amd.com)': '(回车随机)',
+}
+for old, new_value in prompt_replacements.items():
+    text = text.replace(old, new_value)
+text = text.replace('www.amd.com):', '回车随机):')
+text = text.replace('www.amd.com]:', '回车随机]:')
+text = re.sub(r'(请输入[^"\n]*(?:SNI|sni|伪装域名|域名)[^"\n]*?)回车默认\s*www\.amd\.com', r'\1回车随机', text)
+text = re.sub(r'(请输入[^"\n]*(?:SNI|sni|伪装域名|域名)[^"\n]*?)默认\s*www\.amd\.com', r'\1回车随机', text)
+
+# 4) 定点修复 read 后固定默认值的常见结构。
+text = re.sub(
+    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+([A-Za-z_][A-Za-z0-9_]*)\s*\n\s*\[\[\s+-z\s+"\$\2"\s+\]\]\s*&&\s*\2=)"www\.amd\.com"',
+    r'\1"$(_get_random_sni)"',
+    text,
+    flags=re.M,
+)
+text = re.sub(
+    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+([A-Za-z_][A-Za-z0-9_]*)\s*\n\s*\2=\$\{\2:-)www\.amd\.com(\})',
     r'\1$(_get_random_sni)\3',
     text,
     flags=re.M,
