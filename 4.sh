@@ -3,7 +3,7 @@ set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15-continuity-first-debian-alpine"
+export SCRIPT_VERSION="15-burst-guard-no-normal-limit-debian-alpine"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
@@ -18,6 +18,18 @@ export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
 export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
 # 低内存默认采用“保连通优先”：牺牲部分吞吐，尽量避免 OOM/GC 抖动导致断流。
 export SB_STABILITY_MODE="${SB_STABILITY_MODE:-continuity}"
+# stress_guard=on: 低内存测速/突发并发保护，牺牲峰值速度，避免 systemd 硬杀和 OOM 突断
+export SB_STRESS_GUARD="${SB_STRESS_GUARD:-on}"
+# throttle=adaptive: 平时不固定限速；只有检测到突发连接/测速压力时才临时套 tc 削峰。
+export SB_THROTTLE_GUARD="${SB_THROTTLE_GUARD:-adaptive}"
+# 默认不做常态带宽限制。手动执行 apply-rate-limit 或设置数字时才固定限速。
+export SB_RATE_LIMIT_MBIT="${SB_RATE_LIMIT_MBIT:-off}"
+# burst guard: 给代理入口端口加并发连接上限。正常网页/视频不受影响，测速多线程超过阈值会被拒绝，避免服务被打崩。
+export SB_BURST_CONN_GUARD="${SB_BURST_CONN_GUARD:-on}"
+export SB_CONN_LIMIT="${SB_CONN_LIMIT:-auto}"
+# adaptive rate guard: 守护脚本检测到连接数过高时临时启用 tc，恢复后自动清除。
+export SB_ADAPTIVE_RATE_GUARD="${SB_ADAPTIVE_RATE_GUARD:-on}"
+export SB_BURST_RATE_LIMIT_MBIT="${SB_BURST_RATE_LIMIT_MBIT:-auto}"
 
 # --- 核心工具函数 ---
 
@@ -256,6 +268,102 @@ _init_server_ip() {
     fi
 }
 
+
+# 配置预检：避免新配置错误时重启导致当前连接直接中断
+_validate_singbox_config() {
+    [ -x "$SINGBOX_BIN" ] || return 0
+    [ -s "$CONFIG_FILE" ] || return 0
+
+    local check_log="/tmp/sing-box-config-check.log"
+    local args=("-c" "$CONFIG_FILE")
+    [ -s "${SINGBOX_DIR}/relay.json" ] && args+=("-c" "${SINGBOX_DIR}/relay.json")
+
+    if "$SINGBOX_BIN" check "${args[@]}" >"$check_log" 2>&1; then
+        return 0
+    fi
+
+    _error "sing-box 配置检查失败，已取消本次 start/restart，避免服务因坏配置断开。"
+    tail -n 30 "$check_log" >&2 2>/dev/null || true
+    return 1
+}
+
+_validate_xray_config() {
+    local xray_bin="/usr/local/bin/xray"
+    local xray_cfg="/usr/local/etc/xray/config.json"
+    [ -x "$xray_bin" ] || return 0
+    [ -s "$xray_cfg" ] || return 0
+
+    local check_log="/tmp/xray-config-check.log"
+    if "$xray_bin" test -config "$xray_cfg" >"$check_log" 2>&1; then
+        return 0
+    fi
+
+    _error "Xray 配置检查失败，已取消本次 start/restart，避免服务因坏配置断开。"
+    tail -n 30 "$check_log" >&2 2>/dev/null || true
+    return 1
+}
+
+_is_service_active() {
+    local svc="$1"
+    [ -z "$INIT_SYSTEM" ] && _detect_init_system
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$svc" 2>/dev/null ;;
+        openrc) rc-service "$svc" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+_start_service_if_needed() {
+    local svc="$1"
+    [ -z "$INIT_SYSTEM" ] && _detect_init_system
+    case "$INIT_SYSTEM" in
+        systemd) systemctl start "$svc" >/dev/null 2>&1 ;;
+        openrc) rc-service "$svc" start >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 稳定性守护：服务异常退出时自动拉起；配置坏时不强拉，避免反复重启
+_stability_watchdog() {
+    export SB_REFRESHING_RUNTIME_LIMITS=1
+    _detect_init_system
+    _apply_low_mem_optimizations >/dev/null 2>&1 || true
+    _apply_adaptive_rate_limit_guard >/dev/null 2>&1 || true
+
+    if [ -s "$CONFIG_FILE" ] && [ -x "$SINGBOX_BIN" ]; then
+        if ! _is_service_active sing-box; then
+            if _validate_singbox_config >/dev/null 2>&1; then
+                logger "sb-stability: sing-box inactive, starting" 2>/dev/null || true
+                _start_service_if_needed sing-box
+            else
+                logger "sb-stability: sing-box config invalid, skip restart" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    if [ -s "/usr/local/etc/xray/config.json" ] && [ -x "/usr/local/bin/xray" ]; then
+        if ! _is_service_active xray; then
+            if _validate_xray_config >/dev/null 2>&1; then
+                logger "sb-stability: xray inactive, starting" 2>/dev/null || true
+                _start_service_if_needed xray
+            else
+                logger "sb-stability: xray config invalid, skip restart" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    unset SB_REFRESHING_RUNTIME_LIMITS
+}
+
+_enable_stability_watchdog() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    [ -f "$SELF_SCRIPT_PATH" ] || return 0
+    local job="* * * * * bash ${SELF_SCRIPT_PATH} stability-watchdog >/dev/null 2>&1"
+    local current
+    current=$(crontab -l 2>/dev/null | grep -Fv "stability-watchdog" || true)
+    (printf '%s\n' "$current"; echo "$job") | sed '/^$/d' | crontab - >/dev/null 2>&1 || true
+}
+
 # 统一服务管理
 _manage_service() {
     local action="$1"
@@ -268,6 +376,7 @@ _manage_service() {
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
         fi
+        _validate_singbox_config || return 1
     fi
 
     [ -z "$INIT_SYSTEM" ] && _detect_init_system
@@ -313,17 +422,31 @@ _pkg_install() {
 _atomic_modify_json() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
-    else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
+    local tmp
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if jq "$filter" "$file" > "$tmp" && jq empty "$tmp" >/dev/null 2>&1; then
+        cp -f "$file" "${file}.bak" 2>/dev/null || true
+        mv "$tmp" "$file"
+    else
+        _error "修改JSON失败: $file"
+        rm -f "$tmp"
+        return 1
+    fi
 }
 _atomic_modify_json_arg() {
     local file="$1"
     shift
     [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    if jq "$@" "$file" > "$tmp"; then mv "$tmp" "$file"
-    else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
+    local tmp
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if jq "$@" "$file" > "$tmp" && jq empty "$tmp" >/dev/null 2>&1; then
+        cp -f "$file" "${file}.bak" 2>/dev/null || true
+        mv "$tmp" "$file"
+    else
+        _error "修改JSON失败: $file"
+        rm -f "$tmp"
+        return 1
+    fi
 }
 _atomic_modify_yaml() {
     local file="$1" filter="$2"
@@ -488,62 +611,67 @@ _get_runtime_profile_value() {
     local node_count=$(_count_active_proxy_nodes 2>/dev/null || echo 0)
     local heavy_count=$(_count_runtime_heavy_items 2>/dev/null || echo 0)
     local stability="${SB_STABILITY_MODE:-continuity}"
-    local gomem gogc gomax nofile memmax memhigh tier tasks loglevel
+    local gomem gogc gomax nofile memmax memhigh tier tasks loglevel cpuquota
 
     # continuity：保连通优先。策略是压低峰值内存、降低并发资源上限、减少日志/缓存，牺牲部分速度换稳定。
     if [ "$stability" = "continuity" ]; then
         if [ "$mem_mb" -le 128 ]; then
             tier="128m-continuity"
-            gomem=56
-            gogc=70
+            gomem=48
+            gogc=60
             gomax=1
-            nofile=2048
-            tasks=96
-            memhigh="96M"
-            memmax="124M"
+            nofile=1024
+            tasks=80
+            memhigh="86M"
+            memmax="infinity"
+            cpuquota="50%"
             loglevel="error"
         elif [ "$mem_mb" -le 192 ]; then
             tier="192m-continuity"
-            gomem=80
-            gogc=80
+            gomem=72
+            gogc=70
             gomax=1
-            nofile=3072
-            tasks=128
-            memhigh="150M"
-            memmax="186M"
+            nofile=1536
+            tasks=112
+            memhigh="130M"
+            memmax="infinity"
+            cpuquota="60%"
             loglevel="error"
         elif [ "$mem_mb" -le 256 ]; then
             tier="256m-continuity"
-            gomem=112
-            gogc=90
+            gomem=96
+            gogc=80
             gomax=1
-            nofile=4096
-            tasks=160
-            memhigh="200M"
-            memmax="248M"
+            nofile=2048
+            tasks=128
+            memhigh="175M"
+            memmax="infinity"
+            cpuquota="70%"
             loglevel="error"
         elif [ "$mem_mb" -le 512 ]; then
             tier="512m-continuity"
-            gomem=224
-            gogc=100
-            gomax=2
-            nofile=8192
-            tasks=224
-            memhigh="400M"
-            memmax="500M"
+            gomem=192
+            gogc=90
+            gomax=1
+            nofile=4096
+            tasks=192
+            memhigh="360M"
+            memmax="infinity"
+            cpuquota="85%"
             loglevel="warn"
         else
             tier="normal-continuity"
-            gomem=$((mem_mb * 45 / 100))
+            gomem=$((mem_mb * 40 / 100))
             [ "$gomem" -lt 224 ] && gomem=224
             [ "$gomem" -gt 768 ] && gomem=768
-            gogc=100
+            gogc=90
             gomax=$(_cpu_count)
-            [ "$gomax" -gt 4 ] && gomax=4
-            nofile=16384
-            tasks=384
-            memhigh=$((mem_mb * 75 / 100))M
-            memmax=$((mem_mb * 95 / 100))M
+            [ "$gomax" -gt 3 ] && gomax=3
+            nofile=8192
+            tasks=320
+            memhigh=$((mem_mb * 70 / 100))M
+            memmax="infinity"
+            cpuquota="100%"
             loglevel="warn"
         fi
     elif [ "$mode" = "multi" ]; then
@@ -660,6 +788,14 @@ _get_runtime_profile_value() {
         fi
     fi
 
+    [ -z "${cpuquota:-}" ] && cpuquota="100%"
+
+    # stress_guard 开启时，不使用 systemd MemoryMax 硬限制，避免多线程测速瞬间触顶后服务被 systemd 直接杀掉；
+    # 仍保留 MemoryHigh 软压力和 GOMEMLIMIT 控制，真正的容器 cgroup 上限仍由宿主控制。
+    if [ "${SB_STRESS_GUARD:-on}" = "on" ] && [ "${SB_STABILITY_MODE:-continuity}" = "continuity" ]; then
+        memmax="infinity"
+    fi
+
     case "$key" in
         mem_mb) echo "$mem_mb" ;;
         node_count) echo "$node_count" ;;
@@ -674,6 +810,7 @@ _get_runtime_profile_value() {
         memhigh) echo "$memhigh" ;;
         memmax) echo "$memmax" ;;
         tasks) echo "$tasks" ;;
+        cpuquota) echo "$cpuquota" ;;
         loglevel) echo "$loglevel" ;;
         *) return 1 ;;
     esac
@@ -691,8 +828,10 @@ _print_runtime_profile() {
     local memhigh=$(_get_runtime_profile_value memhigh)
     local memmax=$(_get_runtime_profile_value memmax)
     local nofile=$(_get_runtime_profile_value nofile)
+    local cpuquota=$(_get_runtime_profile_value cpuquota)
     local stability=$(_get_runtime_profile_value stability)
-    _info "动态限制: 内存=${mem_mb}MB，节点=${node_count}，重协议=${heavy_count}，策略=${stability}，模式=${mode}，档位=${tier}，GOMEMLIMIT=${gomem}MiB，GOGC=${gogc}，GOMAXPROCS=${gomax}，MemoryHigh=${memhigh}，MemoryMax=${memmax}，NOFILE=${nofile}"
+    local rate_limit=$(_get_rate_limit_mbit 2>/dev/null || echo 0)
+    _info "动态限制: 内存=${mem_mb}MB，节点=${node_count}，重协议=${heavy_count}，策略=${stability}，模式=${mode}，档位=${tier}，GOMEMLIMIT=${gomem}MiB，GOGC=${gogc}，GOMAXPROCS=${gomax}，MemoryHigh=${memhigh}，MemoryMax=${memmax}，NOFILE=${nofile}，CPUQuota=${cpuquota}，NormalRateLimit=${rate_limit}Mbit/s，ConnLimit=$(_get_conn_limit)，StressGuard=${SB_STRESS_GUARD:-on}，ThrottleGuard=${SB_THROTTLE_GUARD:-adaptive}"
     if [ "$stability" = "continuity" ]; then
         _info "当前按保连通优先策略运行：会牺牲部分峰值速度，优先减少低内存断流。"
     elif [ "$mode" = "single" ]; then
@@ -715,6 +854,8 @@ _apply_connectivity_first_optimizations() {
     sysctl -w net.ipv4.tcp_keepalive_probes=4 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_fin_timeout=10 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
 
     if [ "$mem_mb" -le 256 ]; then
         # 低内存下限制 TCP 缓冲增长，牺牲部分吞吐，减少突发连接把内存打满。
@@ -730,6 +871,268 @@ _apply_connectivity_first_optimizations() {
         sysctl -w net.ipv4.tcp_rmem="4096 87380 2097152" >/dev/null 2>&1 || true
         sysctl -w net.ipv4.tcp_wmem="4096 65536 2097152" >/dev/null 2>&1 || true
     fi
+}
+
+
+
+# 固定 tc 限速仅用于手动命令。默认 SB_RATE_LIMIT_MBIT=off，平时不限制带宽。
+_get_rate_limit_mbit() {
+    local manual="${SB_RATE_LIMIT_MBIT:-off}"
+    if [ "$manual" = "off" ] || [ "$manual" = "0" ] || [ -z "$manual" ]; then
+        echo "0"
+        return 0
+    fi
+    if [[ "$manual" =~ ^[0-9]+$ ]] && [ "$manual" -gt 0 ]; then
+        echo "$manual"
+        return 0
+    fi
+
+    # 兼容旧 auto：只有用户显式设置 auto 时，才给出一个固定限速建议；默认不会使用。
+    local mem_mb=$(_get_total_mem_mb)
+    local rate
+    if [ "$mem_mb" -le 128 ]; then rate=12
+    elif [ "$mem_mb" -le 192 ]; then rate=20
+    elif [ "$mem_mb" -le 256 ]; then rate=30
+    elif [ "$mem_mb" -le 512 ]; then rate=70
+    else rate=120
+    fi
+    echo "$rate"
+}
+
+_get_burst_rate_limit_mbit() {
+    local manual="${SB_BURST_RATE_LIMIT_MBIT:-auto}"
+    if [ "$manual" = "off" ] || [ "$manual" = "0" ]; then echo "0"; return 0; fi
+    if [[ "$manual" =~ ^[0-9]+$ ]] && [ "$manual" -gt 0 ]; then echo "$manual"; return 0; fi
+    local mem_mb=$(_get_total_mem_mb)
+    local rate
+    if [ "$mem_mb" -le 128 ]; then rate=10
+    elif [ "$mem_mb" -le 192 ]; then rate=16
+    elif [ "$mem_mb" -le 256 ]; then rate=24
+    elif [ "$mem_mb" -le 512 ]; then rate=55
+    else rate=100
+    fi
+    echo "$rate"
+}
+
+_get_conn_limit() {
+    local manual="${SB_CONN_LIMIT:-auto}"
+    if [ "$manual" = "off" ] || [ "$manual" = "0" ]; then echo "0"; return 0; fi
+    if [[ "$manual" =~ ^[0-9]+$ ]] && [ "$manual" -gt 0 ]; then echo "$manual"; return 0; fi
+    local mem_mb=$(_get_total_mem_mb)
+    local node_count=$(_count_active_proxy_nodes 2>/dev/null || echo 0)
+    local heavy_count=$(_count_runtime_heavy_items 2>/dev/null || echo 0)
+    local limit
+    if [ "$mem_mb" -le 128 ]; then limit=24
+    elif [ "$mem_mb" -le 192 ]; then limit=32
+    elif [ "$mem_mb" -le 256 ]; then limit=48
+    elif [ "$mem_mb" -le 512 ]; then limit=96
+    else limit=160
+    fi
+    # 多节点/重协议时减少每个源 IP 的并发入口连接，防测速多线程瞬间把服务打崩。
+    if [ "$node_count" -ge 2 ] 2>/dev/null; then limit=$((limit * 80 / 100)); fi
+    if [ "$heavy_count" -ge 1 ] 2>/dev/null && [ "$mem_mb" -le 512 ] 2>/dev/null; then limit=$((limit * 85 / 100)); fi
+    [ "$limit" -lt 16 ] && limit=16
+    echo "$limit"
+}
+
+_detect_default_netdev() {
+    local dev=""
+    if command -v ip >/dev/null 2>&1; then
+        dev=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}' | head -n1)
+        [ -z "$dev" ] && dev=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}' | head -n1)
+    fi
+    echo "$dev"
+}
+
+_apply_rate_limit_guard() {
+    [ "${SB_THROTTLE_GUARD:-on}" = "on" ] || return 0
+    local rate=$(_get_rate_limit_mbit)
+    [ -z "$rate" ] && return 0
+    if [ "$rate" = "0" ]; then
+        _clear_rate_limit_guard >/dev/null 2>&1 || true
+        return 0
+    fi
+    command -v tc >/dev/null 2>&1 || return 0
+    local dev=$(_detect_default_netdev)
+    [ -z "$dev" ] && return 0
+
+    # TBF 只做出站整形。对代理下载来说，出站到用户侧被限制后会形成 TCP 背压，降低测速突发冲击。
+    # LXC/非特权容器没有 CAP_NET_ADMIN 时会失败，静默跳过。
+    tc qdisc replace dev "$dev" root tbf rate "${rate}mbit" burst 64kb latency 400ms >/dev/null 2>&1 || return 0
+    return 0
+}
+
+_clear_rate_limit_guard() {
+    command -v tc >/dev/null 2>&1 || return 0
+    local dev=$(_detect_default_netdev)
+    [ -z "$dev" ] && return 0
+    tc qdisc del dev "$dev" root >/dev/null 2>&1 || true
+}
+
+_show_rate_limit_guard() {
+    local rate=$(_get_rate_limit_mbit)
+    local dev=$(_detect_default_netdev)
+    echo "RateLimit: ${rate} Mbit/s"
+    echo "NetDev: ${dev:-unknown}"
+    if command -v tc >/dev/null 2>&1 && [ -n "$dev" ]; then
+        tc qdisc show dev "$dev" 2>/dev/null || true
+    else
+        echo "tc: unavailable"
+    fi
+}
+
+# 突发测速保护：降低瞬时资源冲击。重点避免服务因 MemoryMax/OOM 被杀，不保证测速高分。
+
+_list_proxy_listen_ports() {
+    {
+        if [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+            jq -r '.inbounds[]? | select(.listen_port != null) | .listen_port' "$CONFIG_FILE" 2>/dev/null || true
+        fi
+        if [ -s "/usr/local/etc/xray/config.json" ] && command -v jq >/dev/null 2>&1; then
+            jq -r '.inbounds[]? | select(.port != null) | .port' /usr/local/etc/xray/config.json 2>/dev/null || true
+        fi
+    } | awk '/^[0-9]+$/ && $1>=1 && $1<=65535 {print $1}' | sort -n | uniq
+}
+
+_apply_burst_conn_guard() {
+    [ "${SB_BURST_CONN_GUARD:-on}" = "on" ] || return 0
+    local limit=$(_get_conn_limit)
+    [ -z "$limit" ] && return 0
+    [ "$limit" = "0" ] && { _clear_burst_conn_guard >/dev/null 2>&1 || true; return 0; }
+    command -v iptables >/dev/null 2>&1 || return 0
+    local ports
+    ports=$(_list_proxy_listen_ports)
+    [ -z "$ports" ] && return 0
+
+    iptables -N SB_BURST_GUARD 2>/dev/null || true
+    iptables -F SB_BURST_GUARD 2>/dev/null || return 0
+    iptables -C INPUT -j SB_BURST_GUARD 2>/dev/null || iptables -I INPUT 1 -j SB_BURST_GUARD 2>/dev/null || true
+
+    local p
+    for p in $ports; do
+        # 每个源 IP 对单端口的并发连接超过阈值后拒绝新增连接。已有连接不被主动断开。
+        iptables -A SB_BURST_GUARD -p tcp --dport "$p" -m connlimit --connlimit-above "$limit" --connlimit-mask 32 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+    done
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -N SB_BURST_GUARD 2>/dev/null || true
+        ip6tables -F SB_BURST_GUARD 2>/dev/null || true
+        ip6tables -C INPUT -j SB_BURST_GUARD 2>/dev/null || ip6tables -I INPUT 1 -j SB_BURST_GUARD 2>/dev/null || true
+        for p in $ports; do
+            ip6tables -A SB_BURST_GUARD -p tcp --dport "$p" -m connlimit --connlimit-above "$limit" --connlimit-mask 128 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+        done
+    fi
+    _save_iptables_rules 2>/dev/null || true
+    return 0
+}
+
+_clear_burst_conn_guard() {
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -j SB_BURST_GUARD 2>/dev/null || true
+        iptables -F SB_BURST_GUARD 2>/dev/null || true
+        iptables -X SB_BURST_GUARD 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D INPUT -j SB_BURST_GUARD 2>/dev/null || true
+        ip6tables -F SB_BURST_GUARD 2>/dev/null || true
+        ip6tables -X SB_BURST_GUARD 2>/dev/null || true
+    fi
+    _save_iptables_rules 2>/dev/null || true
+}
+
+_count_proxy_established_conns() {
+    command -v ss >/dev/null 2>&1 || { echo 0; return 0; }
+    local ports p regex=""
+    ports=$(_list_proxy_listen_ports)
+    [ -z "$ports" ] && { echo 0; return 0; }
+    for p in $ports; do regex="${regex}|:${p}$"; done
+    regex="(${regex#|})"
+    ss -Htan state established 2>/dev/null | awk -v r="$regex" '{print $4}' | grep -Ec "$regex" 2>/dev/null || echo 0
+}
+
+_apply_adaptive_rate_limit_guard() {
+    [ "${SB_ADAPTIVE_RATE_GUARD:-on}" = "on" ] || return 0
+    [ "${SB_THROTTLE_GUARD:-adaptive}" = "adaptive" ] || return 0
+    command -v tc >/dev/null 2>&1 || return 0
+    local limit=$(_get_conn_limit)
+    [ -z "$limit" ] && return 0
+    [ "$limit" = "0" ] && return 0
+    local conns=$(_count_proxy_established_conns)
+    local trigger=$((limit * 80 / 100))
+    local clear_at=$((limit * 50 / 100))
+    [ "$trigger" -lt 12 ] && trigger=12
+    [ "$clear_at" -lt 8 ] && clear_at=8
+
+    if [ "$conns" -ge "$trigger" ] 2>/dev/null; then
+        local rate=$(_get_burst_rate_limit_mbit)
+        [ "$rate" = "0" ] && return 0
+        local dev=$(_detect_default_netdev)
+        [ -z "$dev" ] && return 0
+        tc qdisc replace dev "$dev" root tbf rate "${rate}mbit" burst 64kb latency 400ms >/dev/null 2>&1 || true
+        logger "sb-burst-guard: high connections=${conns}, temporary tc rate=${rate}mbit" 2>/dev/null || true
+    elif [ "$conns" -le "$clear_at" ] 2>/dev/null; then
+        _clear_rate_limit_guard >/dev/null 2>&1 || true
+    fi
+}
+
+_show_burst_guard() {
+    echo "BurstConnGuard: ${SB_BURST_CONN_GUARD:-on}"
+    echo "ConnLimitPerSourcePerPort: $(_get_conn_limit)"
+    echo "AdaptiveRateGuard: ${SB_ADAPTIVE_RATE_GUARD:-on}"
+    echo "NormalRateLimit: ${SB_RATE_LIMIT_MBIT:-off}"
+    echo "BurstRateLimit: $(_get_burst_rate_limit_mbit) Mbit/s"
+    echo "CurrentProxyEstablishedConns: $(_count_proxy_established_conns)"
+    echo "Ports: $(_list_proxy_listen_ports | xargs echo 2>/dev/null)"
+    if command -v iptables >/dev/null 2>&1; then
+        echo "---- iptables SB_BURST_GUARD ----"
+        iptables -S SB_BURST_GUARD 2>/dev/null || true
+    fi
+    _show_rate_limit_guard 2>/dev/null || true
+}
+
+_apply_speedtest_guard_optimizations() {
+    local mem_mb=$(_get_total_mem_mb)
+    [ "${SB_STRESS_GUARD:-on}" = "on" ] || return 0
+
+    # 有权限才生效；无权限的 LXC 会静默跳过。
+    if [ "$mem_mb" -le 256 ]; then
+        sysctl -w net.core.somaxconn=512 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_max_syn_backlog=512 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_no_metrics_save=1 >/dev/null 2>&1 || true
+    elif [ "$mem_mb" -le 512 ]; then
+        sysctl -w net.core.somaxconn=1024 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_max_syn_backlog=1024 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_no_metrics_save=1 >/dev/null 2>&1 || true
+    fi
+
+    # 如果 systemd 可用，尽量清理旧失败状态，避免多次崩溃后被 start-limit 卡住。
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reset-failed sing-box 2>/dev/null || true
+        systemctl reset-failed xray 2>/dev/null || true
+    fi
+}
+
+_diagnose_proxy_exit() {
+    echo "==== Memory ===="
+    free -m 2>/dev/null || true
+    echo ""
+    echo "==== Top RSS ===="
+    ps -eo pid,comm,rss,%mem,%cpu --sort=-rss 2>/dev/null | head -20 || true
+    echo ""
+    echo "==== OOM / killed ===="
+    dmesg -T 2>/dev/null | grep -i -E "oom|killed process|out of memory|memory cgroup" | tail -50 || true
+    echo ""
+    echo "==== sing-box service ===="
+    systemctl status sing-box --no-pager -l 2>/dev/null || rc-service sing-box status 2>/dev/null || true
+    echo ""
+    echo "==== xray service ===="
+    systemctl status xray --no-pager -l 2>/dev/null || rc-service xray status 2>/dev/null || true
+    echo ""
+    echo "==== Recent sing-box logs ===="
+    journalctl -u sing-box --no-pager -n 80 2>/dev/null || tail -n 80 /var/log/sing-box.log 2>/dev/null || true
+    echo ""
+    echo "==== Recent xray logs ===="
+    journalctl -u xray --no-pager -n 80 2>/dev/null || tail -n 80 /var/log/xray/access.log 2>/dev/null || true
 }
 
 _get_cloudflared_gomem_limit() {
@@ -749,9 +1152,12 @@ _apply_low_mem_optimizations() {
     _print_runtime_profile
     _apply_single_protocol_network_tuning 2>/dev/null || true
     [ "${SB_STABILITY_MODE:-continuity}" = "continuity" ] && _apply_connectivity_first_optimizations 2>/dev/null || true
+    _apply_speedtest_guard_optimizations 2>/dev/null || true
+    _apply_burst_conn_guard 2>/dev/null || true
+    _apply_adaptive_rate_limit_guard 2>/dev/null || true
 
     if [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        _atomic_modify_json "$CONFIG_FILE" --arg level "$log_level" '
+        _atomic_modify_json_arg "$CONFIG_FILE" --arg level "$log_level" '
           .log = (.log // {}) |
           .log.level = $level |
           .log.timestamp = false |
@@ -794,6 +1200,10 @@ _apply_single_protocol_network_tuning() {
     sysctl -w net.ipv4.tcp_keepalive_probes=3 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
 }
 
 # 动态刷新服务限制：每次 start/restart/refresh-limits 都重写 unit/init 脚本，确保节点数量变化后限制立即更新。
@@ -821,6 +1231,7 @@ _refresh_dynamic_runtime_limits() {
         fi
     fi
 
+    _enable_stability_watchdog 2>/dev/null || true
     unset SB_REFRESHING_RUNTIME_LIMITS
 }
 
@@ -869,7 +1280,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
+export -f _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _validate_singbox_config _validate_xray_config _is_service_active _start_service_if_needed _stability_watchdog _enable_stability_watchdog _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_rate_limit_mbit _detect_default_netdev _apply_rate_limit_guard _clear_rate_limit_guard _show_rate_limit_guard _get_burst_rate_limit_mbit _get_conn_limit _list_proxy_listen_ports _apply_burst_conn_guard _clear_burst_conn_guard _count_proxy_established_conns _apply_adaptive_rate_limit_guard _show_burst_guard _apply_speedtest_guard_optimizations _diagnose_proxy_exit _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
 
 export DEFAULT_SNI="$(_get_random_sni)"
 export MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
@@ -2042,14 +2453,17 @@ _create_systemd_service() {
     local memhigh=$(_get_runtime_profile_value memhigh)
     local memmax=$(_get_runtime_profile_value memmax)
     local tasks=$(_get_runtime_profile_value tasks)
+    local cpuquota=$(_get_runtime_profile_value cpuquota)
     local mode=$(_get_runtime_profile_value mode)
     
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
@@ -2058,17 +2472,30 @@ Environment="GOMAXPROCS=${gomax}"
 Environment="GODEBUG=madvdontneed=1"
 Environment="MALLOC_ARENA_MAX=1"
 Environment="SB_LOWMEM_MODE=${mode}"
+Environment="SB_STRESS_GUARD=${SB_STRESS_GUARD:-on}"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
 Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+Environment="SB_THROTTLE_GUARD=${SB_THROTTLE_GUARD:-adaptive}"
+Environment="SB_RATE_LIMIT_MBIT=${SB_RATE_LIMIT_MBIT:-off}"
+Environment="SB_BURST_CONN_GUARD=${SB_BURST_CONN_GUARD:-on}"
+Environment="SB_CONN_LIMIT=${SB_CONN_LIMIT:-auto}"
+Environment="SB_ADAPTIVE_RATE_GUARD=${SB_ADAPTIVE_RATE_GUARD:-on}"
+Environment="SB_BURST_RATE_LIMIT_MBIT=${SB_BURST_RATE_LIMIT_MBIT:-auto}"
+ExecStartPre=/bin/sh -c 'bash "${SELF_SCRIPT_PATH}" apply-burst-guard --quiet >/dev/null 2>&1 || true'
+ExecStartPre=/bin/sh -c 'if [ -s "${SINGBOX_DIR}/relay.json" ]; then "${SINGBOX_BIN}" check -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json"; else "${SINGBOX_BIN}" check -c "${CONFIG_FILE}"; fi'
 ExecStart=/bin/sh -c 'if [ -s "${SINGBOX_DIR}/relay.json" ]; then exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json"; else exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}"; fi'
-Restart=on-failure
+Restart=always
 RestartSec=2s
+TimeoutStopSec=10s
+KillSignal=SIGINT
 MemoryAccounting=true
 MemoryHigh=${memhigh}
 MemoryMax=${memmax}
 LimitNOFILE=${nofile}
 TasksMax=${tasks}
+CPUAccounting=true
+CPUQuota=${cpuquota}
 OOMScoreAdjust=-900
 OOMPolicy=continue
 
@@ -2094,7 +2521,7 @@ command="/bin/sh"
 command_args='-c "if [ -s ${SINGBOX_DIR}/relay.json ]; then exec ${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json; else exec ${SINGBOX_BIN} run -c ${CONFIG_FILE}; fi"'
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${gogc} --env GOMAXPROCS=${gomax} --env GODEBUG=madvdontneed=1 --env MALLOC_ARENA_MAX=1 --env SB_LOWMEM_MODE=${mode} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${gogc} --env GOMAXPROCS=${gomax} --env GODEBUG=madvdontneed=1 --env MALLOC_ARENA_MAX=1 --env SB_LOWMEM_MODE=${mode} --env SB_STRESS_GUARD=${SB_STRESS_GUARD:-on} --env SB_THROTTLE_GUARD=${SB_THROTTLE_GUARD:-adaptive} --env SB_RATE_LIMIT_MBIT=${SB_RATE_LIMIT_MBIT:-off} --env SB_BURST_CONN_GUARD=${SB_BURST_CONN_GUARD:-on} --env SB_CONN_LIMIT=${SB_CONN_LIMIT:-auto} --env SB_ADAPTIVE_RATE_GUARD=${SB_ADAPTIVE_RATE_GUARD:-on} --env SB_BURST_RATE_LIMIT_MBIT=${SB_BURST_RATE_LIMIT_MBIT:-auto} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
 rc_ulimit="-n ${nofile}"
@@ -2104,6 +2531,10 @@ pidfile="${PID_FILE}"
 # 如果不支持，日志可能不会输出到文件，但服务能正常运行
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
+
+start_pre() {
+    bash "${SELF_SCRIPT_PATH}" apply-burst-guard --quiet >/dev/null 2>&1 || true
+}
 
 depend() {
     need net
@@ -4793,6 +5224,7 @@ _create_xray_service_from_main() {
     local memhigh=$(_get_runtime_profile_value memhigh)
     local memmax=$(_get_runtime_profile_value memmax)
     local tasks=$(_get_runtime_profile_value tasks)
+    local cpuquota=$(_get_runtime_profile_value cpuquota)
     local mode=$(_get_runtime_profile_value mode)
 
     _print_runtime_profile
@@ -4802,8 +5234,10 @@ _create_xray_service_from_main() {
         cat > /etc/systemd/system/xray.service << EOF
 [Unit]
 Description=Xray Service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -4813,14 +5247,27 @@ Environment="GOMAXPROCS=${gomax}"
 Environment="GODEBUG=madvdontneed=1"
 Environment="MALLOC_ARENA_MAX=1"
 Environment="SB_LOWMEM_MODE=${mode}"
+Environment="SB_STRESS_GUARD=${SB_STRESS_GUARD:-on}"
+Environment="SB_THROTTLE_GUARD=${SB_THROTTLE_GUARD:-adaptive}"
+Environment="SB_RATE_LIMIT_MBIT=${SB_RATE_LIMIT_MBIT:-off}"
+Environment="SB_BURST_CONN_GUARD=${SB_BURST_CONN_GUARD:-on}"
+Environment="SB_CONN_LIMIT=${SB_CONN_LIMIT:-auto}"
+Environment="SB_ADAPTIVE_RATE_GUARD=${SB_ADAPTIVE_RATE_GUARD:-on}"
+Environment="SB_BURST_RATE_LIMIT_MBIT=${SB_BURST_RATE_LIMIT_MBIT:-auto}"
+ExecStartPre=/bin/sh -c 'bash "${SELF_SCRIPT_PATH}" apply-burst-guard --quiet >/dev/null 2>&1 || true'
+ExecStartPre=${xray_bin} test -config ${xray_dir}/config.json
 ExecStart=${xray_bin} run -c ${xray_dir}/config.json
-Restart=on-failure
+Restart=always
 RestartSec=2
+TimeoutStopSec=10s
+KillSignal=SIGINT
 MemoryAccounting=true
 MemoryHigh=${memhigh}
 MemoryMax=${memmax}
 LimitNOFILE=${nofile}
 TasksMax=${tasks}
+CPUAccounting=true
+CPUQuota=${cpuquota}
 OOMScoreAdjust=-900
 OOMPolicy=continue
 
@@ -4845,6 +5292,17 @@ export GOMAXPROCS="${gomax}"
 export GODEBUG="madvdontneed=1"
 export MALLOC_ARENA_MAX="1"
 export SB_LOWMEM_MODE="${mode}"
+export SB_STRESS_GUARD="${SB_STRESS_GUARD:-on}"
+export SB_THROTTLE_GUARD="${SB_THROTTLE_GUARD:-adaptive}"
+export SB_RATE_LIMIT_MBIT="${SB_RATE_LIMIT_MBIT:-off}"
+export SB_BURST_CONN_GUARD="${SB_BURST_CONN_GUARD:-on}"
+export SB_CONN_LIMIT="${SB_CONN_LIMIT:-auto}"
+export SB_ADAPTIVE_RATE_GUARD="${SB_ADAPTIVE_RATE_GUARD:-on}"
+export SB_BURST_RATE_LIMIT_MBIT="${SB_BURST_RATE_LIMIT_MBIT:-auto}"
+
+start_pre() {
+    bash "${SELF_SCRIPT_PATH}" apply-burst-guard --quiet >/dev/null 2>&1 || true
+}
 EOF
         chmod +x /etc/init.d/xray
         rc-update add xray default 2>/dev/null
@@ -4922,6 +5380,7 @@ PY_REMOVE_OLD_LIMIT
         python3 - "$script_path" <<'PY_LIMIT_XRAY'
 import re
 import sys
+import os
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -5058,8 +5517,20 @@ _xray_add_node_menu() {
         fi
 
         case $choice in
-            1) _add_vless_reality_vision && [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1; _manage_xray_service "restart" ;;
-            2) _add_shadowsocks_xray && [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1; _manage_xray_service "restart" ;;
+            1)
+                if _add_vless_reality_vision; then
+                    [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1
+                    if [ -n "$MAIN_SCRIPT_PATH" ]; then bash "$MAIN_SCRIPT_PATH" validate-xray || continue; fi
+                    _manage_xray_service "restart"
+                fi
+                ;;
+            2)
+                if _add_shadowsocks_xray; then
+                    [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1
+                    if [ -n "$MAIN_SCRIPT_PATH" ]; then bash "$MAIN_SCRIPT_PATH" validate-xray || continue; fi
+                    _manage_xray_service "restart"
+                fi
+                ;;
             0) return ;;
             *) _error "该协议已删除。当前只允许创建：[1] VLESS+TCP+Reality+Vision、[2] Shadowsocks。" ;;
         esac
@@ -5825,6 +6296,89 @@ while [[ $# -gt 0 ]]; do
             _refresh_dynamic_runtime_limits "all"
             _success "已启用保连通优先策略。"
             exit 0
+            ;;
+        stress-guard|speedtest-guard)
+            _check_root
+            export SB_STABILITY_MODE="continuity"
+            export SB_STRESS_GUARD="on"
+            export SB_BURST_CONN_GUARD="on"
+            export SB_THROTTLE_GUARD="adaptive"
+            _detect_init_system
+            _refresh_dynamic_runtime_limits "all"
+            _apply_burst_conn_guard 2>/dev/null || true
+            _success "已启用多线程/突发保护：平时不限速，测速并发超过阈值会被限制，服务更不容易退出。"
+            exit 0
+            ;;
+        throttle-guard|limit-speed|apply-rate-limit)
+            _check_root
+            export SB_STABILITY_MODE="continuity"
+            export SB_STRESS_GUARD="on"
+            # 手动固定限速命令：仅在你显式设置 SB_RATE_LIMIT_MBIT=数字 或 auto 时生效。默认 off 不限速。
+            export SB_THROTTLE_GUARD="on"
+            _detect_init_system
+            _apply_rate_limit_guard 2>/dev/null || true
+            if [ "$1" != "--quiet" ] && [ "$2" != "--quiet" ]; then
+                _show_rate_limit_guard
+                _success "固定 tc 限速已按 SB_RATE_LIMIT_MBIT 应用；默认 off 表示平时不限速。"
+            fi
+            exit 0
+            ;;
+        burst-guard|protect-burst|apply-burst-guard)
+            _check_root
+            export SB_STABILITY_MODE="continuity"
+            export SB_STRESS_GUARD="on"
+            export SB_BURST_CONN_GUARD="on"
+            export SB_THROTTLE_GUARD="adaptive"
+            _detect_init_system
+            _apply_burst_conn_guard 2>/dev/null || true
+            _apply_adaptive_rate_limit_guard 2>/dev/null || true
+            if [ "$1" != "--quiet" ] && [ "$2" != "--quiet" ]; then
+                _show_burst_guard
+                _success "已应用突发并发保护：平时不限速，测速多线程超过阈值会被限制。"
+            fi
+            exit 0
+            ;;
+        clear-burst-guard|remove-burst-guard)
+            _check_root
+            _clear_burst_conn_guard 2>/dev/null || true
+            _clear_rate_limit_guard 2>/dev/null || true
+            _success "已尝试清除突发保护规则和临时 tc 限速。"
+            exit 0
+            ;;
+        show-burst-guard)
+            _show_burst_guard
+            exit 0
+            ;;
+        clear-rate-limit|remove-rate-limit)
+            _check_root
+            _clear_rate_limit_guard 2>/dev/null || true
+            _success "已尝试清除固定/临时 tc 出站限速。"
+            exit 0
+            ;;
+        show-rate-limit)
+            _show_rate_limit_guard
+            exit 0
+            ;;
+        diagnose-exit|diagnose)
+            _detect_init_system
+            _print_runtime_profile 2>/dev/null || true
+            _diagnose_proxy_exit
+            exit 0
+            ;;
+        stability-watchdog)
+            _detect_init_system
+            _stability_watchdog
+            exit 0
+            ;;
+        validate-config|check-config)
+            _detect_init_system
+            _validate_singbox_config
+            exit $?
+            ;;
+        validate-xray|check-xray)
+            _detect_init_system
+            _validate_xray_config
+            exit $?
             ;;
         refresh-limits|sync-limits)
             _check_root
