@@ -26,11 +26,24 @@ export SB_APT_LOCK_TIMEOUT="${SB_APT_LOCK_TIMEOUT:-30}"
 _with_timeout() {
     local seconds="$1"
     shift
+    local start_ts end_ts rc
+    start_ts=$(date +%s 2>/dev/null || echo 0)
+    _info "执行命令(最长 ${seconds}s): $*"
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$seconds" "$@"
+        timeout -k 5 "$seconds" "$@"
+        rc=$?
     else
+        _warn "系统缺少 timeout 命令，无法强制超时；将直接执行: $*"
         "$@"
+        rc=$?
     fi
+    end_ts=$(date +%s 2>/dev/null || echo 0)
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        _error "命令超时退出(${seconds}s): $*"
+    else
+        _info "命令结束(rc=${rc}, 用时约 $((end_ts-start_ts))s): $*"
+    fi
+    return "$rc"
 }
 
 
@@ -290,10 +303,10 @@ _manage_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if [ "$action" == "status" ]; then systemctl status sing-box --no-pager -l; return; fi
-            systemctl "$action" sing-box ;;
+            _with_timeout 30 systemctl "$action" sing-box ;;
         openrc)
             if [ "$action" == "status" ]; then rc-service sing-box status; return; fi
-            rc-service sing-box "$action" ;;
+            _with_timeout 30 rc-service sing-box "$action" ;;
         *) _error "不支持的服务管理系统" ;;
     esac
 }
@@ -306,17 +319,25 @@ _pkg_install() {
     _assert_supported_os
 
     if command -v apk >/dev/null 2>&1; then
-        # Alpine 包名适配
         pkgs="${pkgs/cron/dcron}"
-        _with_timeout "$SB_INSTALL_TIMEOUT" apk add --no-cache $pkgs >/dev/null 2>&1
+        _info "apk 安装: $pkgs"
+        _with_timeout "$SB_INSTALL_TIMEOUT" apk add --no-cache $pkgs
     elif command -v apt-get >/dev/null 2>&1; then
-        # Debian / Ubuntu
+        _info "apt 安装: $pkgs"
+        local apt_common=(
+            -o Dpkg::Lock::Timeout="${SB_APT_LOCK_TIMEOUT:-30}"
+            -o Acquire::Retries=1
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+            -o DPkg::Use-Pty=0
+        )
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-            _with_timeout "$SB_INSTALL_TIMEOUT" apt-get update -qq >/dev/null 2>&1
+            _with_timeout "$SB_INSTALL_TIMEOUT" env DEBIAN_FRONTEND=noninteractive apt-get update "${apt_common[@]}"
         fi
-        DEBIAN_FRONTEND=noninteractive _with_timeout "$SB_INSTALL_TIMEOUT" apt-get install -y -o Dpkg::Lock::Timeout="$SB_APT_LOCK_TIMEOUT" $pkgs >/dev/null 2>&1 || {
-            _with_timeout "$SB_INSTALL_TIMEOUT" apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive _with_timeout "$SB_INSTALL_TIMEOUT" apt-get install -y -o Dpkg::Lock::Timeout="$SB_APT_LOCK_TIMEOUT" $pkgs >/dev/null 2>&1
+        _with_timeout "$SB_INSTALL_TIMEOUT" env DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_common[@]}" $pkgs || {
+            _warn "首次 apt install 失败，执行一次 update 后重试。"
+            _with_timeout "$SB_INSTALL_TIMEOUT" env DEBIAN_FRONTEND=noninteractive apt-get update "${apt_common[@]}"
+            _with_timeout "$SB_INSTALL_TIMEOUT" env DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_common[@]}" $pkgs
         }
     else
         _error "未检测到受支持的包管理器。仅支持 Debian/Ubuntu 的 apt-get 或 Alpine 的 apk。"
@@ -823,7 +844,7 @@ _refresh_dynamic_runtime_limits() {
         if [ -n "$SERVICE_FILE" ] && [ -f "$SINGBOX_BIN" ]; then
             if [ "$INIT_SYSTEM" = "systemd" ]; then
                 _create_systemd_service 2>/dev/null || true
-                systemctl daemon-reload 2>/dev/null || true
+                _with_timeout 20 systemctl daemon-reload 2>/dev/null || true
             elif [ "$INIT_SYSTEM" = "openrc" ]; then
                 _create_openrc_service 2>/dev/null || true
             fi
@@ -857,10 +878,14 @@ _install_yq() {
         _info "安装 yq..."
         local arch=$(uname -m)
         case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
+        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
             rm -f "$YQ_BINARY"
-            _error "yq 下载失败或文件为空"
-            return 1
+            _warn "wget 下载 yq 失败，改用 curl 重试。"
+            if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
+                rm -f "$YQ_BINARY"
+                _error "yq 下载失败或文件为空"
+                return 1
+            fi
         fi
         chmod +x "$YQ_BINARY"
     fi
@@ -920,8 +945,8 @@ _install_dependencies() {
     # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
     if command -v apk &>/dev/null; then
         if command -v crond &>/dev/null; then
-            rc-service dcron start 2>/dev/null
-            rc-update add dcron default 2>/dev/null
+            _with_timeout 15 rc-service dcron start 2>/dev/null || true
+            _with_timeout 15 rc-update add dcron default 2>/dev/null || true
         fi
     fi
 
@@ -1001,10 +1026,14 @@ _install_sing_box() {
     archive_path="${temp_dir}/sing-box.tar.gz"
 
     _info "正在下载 sing-box 安装包..."
-    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
-        _error "下载失败或文件为空: $download_url"
-        rm -rf "$temp_dir"
-        return 1
+    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
+        rm -f "$archive_path"
+        _warn "wget 下载 sing-box 失败，改用 curl 重试。"
+        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
+            _error "下载失败或文件为空: $download_url"
+            rm -rf "$temp_dir"
+            return 1
+        fi
     fi
 
     _info "正在解压 sing-box 安装包..."
@@ -1063,10 +1092,14 @@ _install_cloudflared() {
     
     local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch_tag}"
     
-    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 -qO "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
+    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
         rm -f "${CLOUDFLARED_BIN}"
-        _error "cloudflared 下载失败或文件为空!"
-        return 1
+        _warn "wget 下载 cloudflared 失败，改用 curl 重试。"
+        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
+            rm -f "${CLOUDFLARED_BIN}"
+            _error "cloudflared 下载失败或文件为空!"
+            return 1
+        fi
     fi
     chmod +x "${CLOUDFLARED_BIN}"
     
