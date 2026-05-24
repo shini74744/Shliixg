@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15"
+export SCRIPT_VERSION="15-continuity-first-debian-alpine"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
@@ -16,6 +16,8 @@ SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
 export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
 export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
+# 低内存默认采用“保连通优先”：牺牲部分吞吐，尽量避免 OOM/GC 抖动导致断流。
+export SB_STABILITY_MODE="${SB_STABILITY_MODE:-continuity}"
 
 # --- 核心工具函数 ---
 
@@ -26,6 +28,87 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 ORANGE='\033[0;33m'
+
+# --- 跨发行版兼容辅助函数 ---
+_detect_supported_distro() {
+    local id=""
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release 2>/dev/null || true
+        id="${ID:-}"
+    fi
+
+    if [ -f /etc/alpine-release ] || [ "$id" = "alpine" ]; then
+        echo "alpine"
+        return 0
+    fi
+
+    case "$id" in
+        debian|ubuntu)
+            echo "$id"
+            return 0
+            ;;
+    esac
+
+    echo "unsupported"
+    return 1
+}
+
+_assert_supported_os() {
+    local os distro
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    if [ "$os" != "Linux" ]; then
+        echo "[错误] 当前脚本仅支持 Linux 服务器系统，不支持 ${os}。" >&2
+        echo "[错误] 支持范围：Debian / Ubuntu / Alpine。" >&2
+        exit 1
+    fi
+
+    distro="$(_detect_supported_distro)"
+    case "$distro" in
+        debian|ubuntu|alpine)
+            return 0
+            ;;
+        *)
+            echo "[错误] 当前发行版不在支持范围内。" >&2
+            echo "[错误] 当前脚本仅支持：Debian / Ubuntu / Alpine。" >&2
+            echo "[提示] 如需在 Alpine 上运行，请先执行：apk add bash" >&2
+            exit 1
+            ;;
+    esac
+}
+
+_cpu_count() {
+    local n=""
+    if command -v nproc >/dev/null 2>&1; then
+        n="$(nproc 2>/dev/null)"
+    fi
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -le 0 ]; then
+        n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    fi
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -le 0 ]; then
+        n=1
+    fi
+    echo "$n"
+}
+
+_file_size_bytes() {
+    local f="$1"
+    [ -f "$f" ] || { echo 0; return; }
+    stat -c%s "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || echo 0
+}
+
+_is_systemd_usable() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] && return 0
+    [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ] && return 0
+    systemctl list-unit-files >/dev/null 2>&1 && return 0
+    return 1
+}
+
+_is_openrc_usable() {
+    command -v rc-service >/dev/null 2>&1 || return 1
+    [ -d /run/openrc ] || [ -f /sbin/openrc-run ] || [ -d /etc/init.d ]
+}
 
 # 打印消息函数
 _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
@@ -83,10 +166,10 @@ _get_ip() { _get_public_ip; } # 别名兼容
 
 # 系统环境检测
 _detect_init_system() {
-    if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
+    if _is_openrc_usable; then
         export INIT_SYSTEM="openrc"
         export SERVICE_FILE="/etc/init.d/sing-box"
-    elif command -v systemctl &>/dev/null; then
+    elif _is_systemd_usable; then
         export INIT_SYSTEM="systemd"
         export SERVICE_FILE="/etc/systemd/system/sing-box.service"
     else
@@ -180,6 +263,7 @@ _manage_service() {
     # [关键核心修复] 动态注入内置 NTP 时间同步模块
     # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
     if [[ "$action" == "restart" || "$action" == "start" ]]; then
+        _refresh_dynamic_runtime_limits "sing-box" 2>/dev/null || true
         if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
@@ -203,20 +287,25 @@ _manage_service() {
 _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
-    if command -v apk &>/dev/null; then
+
+    _assert_supported_os
+
+    if command -v apk >/dev/null 2>&1; then
+        # Alpine 包名适配
+        pkgs="${pkgs/cron/dcron}"
         apk add --no-cache $pkgs >/dev/null 2>&1
-    elif command -v apt-get &>/dev/null; then
-        # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
+    elif command -v apt-get >/dev/null 2>&1; then
+        # Debian / Ubuntu
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
         fi
         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            # 兜底：如果安装失败，强制刷新索引后重试
             apt-get update -qq >/dev/null 2>&1
             DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
         }
-    elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
-    elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
+    else
+        _error "未检测到受支持的包管理器。仅支持 Debian/Ubuntu 的 apt-get 或 Alpine 的 apk。"
+        return 1
     fi
 }
 
@@ -300,11 +389,14 @@ _find_proxy_name() {
 
 # 内存限额计算
 _get_mem_limit() {
-    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
-    local cgroup_limit=""
-    local limit
+    _get_runtime_profile_value gomem
+}
 
-    [ -z "$total_mem_mb" ] && total_mem_mb=128
+
+# 读取容器/小鸡真实内存上限，优先使用 cgroup 限制，而不是母鸡物理内存
+_get_total_mem_mb() {
+    local total_mem_mb=""
+    local cgroup_limit=""
 
     if [ -r /sys/fs/cgroup/memory.max ]; then
         cgroup_limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
@@ -318,19 +410,420 @@ _get_mem_limit() {
         fi
     fi
 
-    if [ "$total_mem_mb" -le 128 ]; then
-        limit=48
-    elif [ "$total_mem_mb" -le 256 ]; then
-        limit=$((total_mem_mb * 50 / 100))
-    elif [ "$total_mem_mb" -le 512 ]; then
-        limit=$((total_mem_mb * 65 / 100))
-    else
-        limit=$((total_mem_mb * 80 / 100))
+    if [ -z "$total_mem_mb" ] || [ "$total_mem_mb" -le 0 ] 2>/dev/null; then
+        total_mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
     fi
 
-    [ "$limit" -lt 32 ] && limit=32
-    echo "$limit"
+    [ -z "$total_mem_mb" ] && total_mem_mb=128
+    echo "$total_mem_mb"
 }
+
+# 统计当前已经创建的代理入站数量。sing-box + Xray + Argo 都计入，用于自动切换 single/multi 档位。
+_count_active_proxy_nodes() {
+    local count=0
+    if [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local c
+        c=$(jq '[.inbounds[]? | select((.tag // "") != "mixed-in" and (.tag // "") != "direct-in" and (.type // "") != "mixed")] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        [[ "$c" =~ ^[0-9]+$ ]] && count=$((count + c))
+    fi
+    if [ -s "/usr/local/etc/xray/config.json" ] && command -v jq >/dev/null 2>&1; then
+        local xc
+        xc=$(jq '[.inbounds[]?] | length' /usr/local/etc/xray/config.json 2>/dev/null || echo 0)
+        [[ "$xc" =~ ^[0-9]+$ ]] && count=$((count + xc))
+    fi
+    if [ -s "$ARGO_METADATA_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local ac
+        ac=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo 0)
+        [[ "$ac" =~ ^[0-9]+$ ]] && count=$((count + ac))
+    fi
+    echo "$count"
+}
+
+_count_runtime_heavy_items() {
+    local heavy=0
+    if [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local h
+        h=$(jq '[.inbounds[]? | select((.type // "") | test("hysteria2|tuic|shadowtls|anytls"; "i"))] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        [[ "$h" =~ ^[0-9]+$ ]] && heavy=$((heavy + h))
+    fi
+    if [ -s "$ARGO_METADATA_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local ac
+        ac=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo 0)
+        [[ "$ac" =~ ^[0-9]+$ ]] && heavy=$((heavy + ac))
+    fi
+    if pgrep -x cloudflared >/dev/null 2>&1; then
+        heavy=$((heavy + 1))
+    fi
+    echo "$heavy"
+}
+
+# 自动判定运行模式：
+# - single：单协议/单节点，给 Go 更多堆空间，减少 GC 卡顿。
+# - multi：多协议/多节点/Argo/低内存重协议，收紧内存，优先防 OOM。
+# 可强制覆盖：export SB_LOWMEM_MODE=single 或 multi；默认 auto。
+_detect_runtime_mode() {
+    local forced="${SB_LOWMEM_MODE:-auto}"
+    local mem_mb=$(_get_total_mem_mb)
+    local node_count=$(_count_active_proxy_nodes 2>/dev/null || echo 0)
+    local heavy_count=$(_count_runtime_heavy_items 2>/dev/null || echo 0)
+
+    case "$forced" in
+        single|multi) echo "$forced"; return ;;
+    esac
+
+    if [ "$node_count" -ge 2 ] 2>/dev/null; then
+        echo "multi"
+    elif [ "$heavy_count" -ge 1 ] 2>/dev/null && [ "$mem_mb" -le 256 ] 2>/dev/null; then
+        echo "multi"
+    else
+        echo "single"
+    fi
+}
+
+# 根据实时内存、节点数、协议负载输出运行参数。所有参数在 start/restart/refresh-limits 时动态重算。
+_get_runtime_profile_value() {
+    local key="$1"
+    local mem_mb=$(_get_total_mem_mb)
+    local mode=$(_detect_runtime_mode)
+    local node_count=$(_count_active_proxy_nodes 2>/dev/null || echo 0)
+    local heavy_count=$(_count_runtime_heavy_items 2>/dev/null || echo 0)
+    local stability="${SB_STABILITY_MODE:-continuity}"
+    local gomem gogc gomax nofile memmax memhigh tier tasks loglevel
+
+    # continuity：保连通优先。策略是压低峰值内存、降低并发资源上限、减少日志/缓存，牺牲部分速度换稳定。
+    if [ "$stability" = "continuity" ]; then
+        if [ "$mem_mb" -le 128 ]; then
+            tier="128m-continuity"
+            gomem=56
+            gogc=70
+            gomax=1
+            nofile=2048
+            tasks=96
+            memhigh="96M"
+            memmax="124M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 192 ]; then
+            tier="192m-continuity"
+            gomem=80
+            gogc=80
+            gomax=1
+            nofile=3072
+            tasks=128
+            memhigh="150M"
+            memmax="186M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 256 ]; then
+            tier="256m-continuity"
+            gomem=112
+            gogc=90
+            gomax=1
+            nofile=4096
+            tasks=160
+            memhigh="200M"
+            memmax="248M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 512 ]; then
+            tier="512m-continuity"
+            gomem=224
+            gogc=100
+            gomax=2
+            nofile=8192
+            tasks=224
+            memhigh="400M"
+            memmax="500M"
+            loglevel="warn"
+        else
+            tier="normal-continuity"
+            gomem=$((mem_mb * 45 / 100))
+            [ "$gomem" -lt 224 ] && gomem=224
+            [ "$gomem" -gt 768 ] && gomem=768
+            gogc=100
+            gomax=$(_cpu_count)
+            [ "$gomax" -gt 4 ] && gomax=4
+            nofile=16384
+            tasks=384
+            memhigh=$((mem_mb * 75 / 100))M
+            memmax=$((mem_mb * 95 / 100))M
+            loglevel="warn"
+        fi
+    elif [ "$mode" = "multi" ]; then
+        # 多协议/多节点：保留系统与 cloudflared/Xray/sing-box 余量，避免 OOM 重启造成断流。
+        if [ "$mem_mb" -le 128 ]; then
+            tier="128m-multi"
+            gomem=56
+            gogc=70
+            gomax=1
+            nofile=4096
+            tasks=128
+            memhigh="100M"
+            memmax="124M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 192 ]; then
+            tier="192m-multi"
+            gomem=80
+            gogc=80
+            gomax=1
+            nofile=6144
+            tasks=160
+            memhigh="150M"
+            memmax="186M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 256 ]; then
+            tier="256m-multi"
+            gomem=112
+            gogc=90
+            gomax=1
+            nofile=8192
+            tasks=192
+            memhigh="200M"
+            memmax="248M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 512 ]; then
+            tier="512m-multi"
+            gomem=224
+            gogc=100
+            gomax=2
+            nofile=16384
+            tasks=256
+            memhigh="400M"
+            memmax="500M"
+            loglevel="warn"
+        else
+            tier="normal-multi"
+            gomem=$((mem_mb * 50 / 100))
+            [ "$gomem" -lt 256 ] && gomem=256
+            [ "$gomem" -gt 896 ] && gomem=896
+            gogc=100
+            gomax=$(_cpu_count)
+            [ "$gomax" -gt 4 ] && gomax=4
+            nofile=32768
+            tasks=512
+            memhigh=$((mem_mb * 80 / 100))M
+            memmax=$((mem_mb * 95 / 100))M
+            loglevel="warn"
+        fi
+    else
+        # 单协议/单节点：避免 GOMEMLIMIT 过低引发高频 GC，优先降低“刷着刷着卡一下”。
+        if [ "$mem_mb" -le 128 ]; then
+            tier="128m-single"
+            gomem=72
+            gogc=90
+            gomax=1
+            nofile=4096
+            tasks=128
+            memhigh="105M"
+            memmax="124M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 192 ]; then
+            tier="192m-single"
+            gomem=104
+            gogc=100
+            gomax=1
+            nofile=6144
+            tasks=160
+            memhigh="155M"
+            memmax="186M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 256 ]; then
+            tier="256m-single"
+            gomem=144
+            gogc=100
+            gomax=1
+            nofile=8192
+            tasks=192
+            memhigh="210M"
+            memmax="248M"
+            loglevel="error"
+        elif [ "$mem_mb" -le 512 ]; then
+            tier="512m-single"
+            gomem=280
+            gogc=100
+            gomax=2
+            nofile=16384
+            tasks=256
+            memhigh="420M"
+            memmax="500M"
+            loglevel="warn"
+        else
+            tier="normal-single"
+            gomem=$((mem_mb * 60 / 100))
+            [ "$gomem" -lt 280 ] && gomem=280
+            [ "$gomem" -gt 1024 ] && gomem=1024
+            gogc=100
+            gomax=$(_cpu_count)
+            [ "$gomax" -gt 4 ] && gomax=4
+            nofile=32768
+            tasks=512
+            memhigh=$((mem_mb * 85 / 100))M
+            memmax=$((mem_mb * 95 / 100))M
+            loglevel="warn"
+        fi
+    fi
+
+    case "$key" in
+        mem_mb) echo "$mem_mb" ;;
+        node_count) echo "$node_count" ;;
+        heavy_count) echo "$heavy_count" ;;
+        mode) echo "$mode" ;;
+        stability) echo "$stability" ;;
+        tier) echo "$tier" ;;
+        gomem) echo "$gomem" ;;
+        gogc) echo "$gogc" ;;
+        gomax) echo "$gomax" ;;
+        nofile) echo "$nofile" ;;
+        memhigh) echo "$memhigh" ;;
+        memmax) echo "$memmax" ;;
+        tasks) echo "$tasks" ;;
+        loglevel) echo "$loglevel" ;;
+        *) return 1 ;;
+    esac
+}
+
+_print_runtime_profile() {
+    local mem_mb=$(_get_runtime_profile_value mem_mb)
+    local node_count=$(_get_runtime_profile_value node_count)
+    local heavy_count=$(_get_runtime_profile_value heavy_count)
+    local mode=$(_get_runtime_profile_value mode)
+    local tier=$(_get_runtime_profile_value tier)
+    local gomem=$(_get_runtime_profile_value gomem)
+    local gogc=$(_get_runtime_profile_value gogc)
+    local gomax=$(_get_runtime_profile_value gomax)
+    local memhigh=$(_get_runtime_profile_value memhigh)
+    local memmax=$(_get_runtime_profile_value memmax)
+    local nofile=$(_get_runtime_profile_value nofile)
+    local stability=$(_get_runtime_profile_value stability)
+    _info "动态限制: 内存=${mem_mb}MB，节点=${node_count}，重协议=${heavy_count}，策略=${stability}，模式=${mode}，档位=${tier}，GOMEMLIMIT=${gomem}MiB，GOGC=${gogc}，GOMAXPROCS=${gomax}，MemoryHigh=${memhigh}，MemoryMax=${memmax}，NOFILE=${nofile}"
+    if [ "$stability" = "continuity" ]; then
+        _info "当前按保连通优先策略运行：会牺牲部分峰值速度，优先减少低内存断流。"
+    elif [ "$mode" = "single" ]; then
+        _info "当前按单协议稳定策略运行；如果后续增加节点，脚本会自动切到 multi 档。"
+    else
+        _info "当前按多协议防 OOM 策略运行；如果后续删回单节点，脚本会自动放宽到 single 档。"
+    fi
+    if [ "$mem_mb" -le 128 ]; then
+        _warn "128M 小鸡建议只跑一个轻量协议；多协议即使动态限制也可能因宿主/NAT/conntrack 抖动而卡顿。"
+    elif [ "$mem_mb" -le 256 ]; then
+        _warn "256M 小鸡可跑单协议；多协议建议低并发，且尽量避免 Argo + Hysteria2 同时运行。"
+    fi
+}
+
+# 保连通优先调优：降低 TCP/UDP 缓冲上限，缩短 FIN 占用，增强 keepalive。无权限环境会静默跳过。
+_apply_connectivity_first_optimizations() {
+    local mem_mb=$(_get_total_mem_mb)
+    sysctl -w net.ipv4.tcp_keepalive_time=60 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=15 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=4 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fin_timeout=10 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+
+    if [ "$mem_mb" -le 256 ]; then
+        # 低内存下限制 TCP 缓冲增长，牺牲部分吞吐，减少突发连接把内存打满。
+        sysctl -w net.core.rmem_max=1048576 >/dev/null 2>&1 || true
+        sysctl -w net.core.wmem_max=1048576 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_rmem="4096 87380 1048576" >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_wmem="4096 65536 1048576" >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.udp_rmem_min=4096 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.udp_wmem_min=4096 >/dev/null 2>&1 || true
+    elif [ "$mem_mb" -le 512 ]; then
+        sysctl -w net.core.rmem_max=2097152 >/dev/null 2>&1 || true
+        sysctl -w net.core.wmem_max=2097152 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_rmem="4096 87380 2097152" >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_wmem="4096 65536 2097152" >/dev/null 2>&1 || true
+    fi
+}
+
+_get_cloudflared_gomem_limit() {
+    local mem_mb=$(_get_total_mem_mb)
+    if [ "$mem_mb" -le 128 ]; then echo 32
+    elif [ "$mem_mb" -le 192 ]; then echo 48
+    elif [ "$mem_mb" -le 256 ]; then echo 64
+    elif [ "$mem_mb" -le 512 ]; then echo 96
+    else echo 160
+    fi
+}
+
+# 写入/收敛运行配置：降低日志量、确保日志轮转任务可用、避免低内存时缓存和日志放大
+_apply_low_mem_optimizations() {
+    local mem_mb=$(_get_total_mem_mb)
+    local log_level=$(_get_runtime_profile_value loglevel)
+    _print_runtime_profile
+    _apply_single_protocol_network_tuning 2>/dev/null || true
+    [ "${SB_STABILITY_MODE:-continuity}" = "continuity" ] && _apply_connectivity_first_optimizations 2>/dev/null || true
+
+    if [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        _atomic_modify_json "$CONFIG_FILE" --arg level "$log_level" '
+          .log = (.log // {}) |
+          .log.level = $level |
+          .log.timestamp = false |
+          .log.disabled = false
+        ' 2>/dev/null || true
+
+        if [ "$mem_mb" -le 256 ]; then
+            _atomic_modify_json "$CONFIG_FILE" '
+              if .dns then
+                .dns.independent_cache = false
+              else
+                .
+              end
+            ' 2>/dev/null || true
+        fi
+    fi
+
+    if [ -f "$LOG_FILE" ]; then
+        local size
+        size=$(_file_size_bytes "$LOG_FILE")
+        if [ "$size" -gt $((512 * 1024)) ]; then
+            tail -n 200 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+}
+
+_warn_lowmem_for_heavy_protocol() {
+    local proto="$1"
+    local mem_mb=$(_get_total_mem_mb)
+    if [ "$mem_mb" -le 256 ]; then
+        _warn "当前内存约 ${mem_mb}MB，${proto} 在低内存 NAT 小鸡上可能出现卡顿/断流；建议 512M+ 或减少并发连接。"
+    fi
+}
+
+_apply_single_protocol_network_tuning() {
+    # 在有权限的环境里做轻量 TCP 保活优化；无权限的 LXC/NAT 小鸡会静默跳过。
+    # 目的不是提速，而是减少长连接空闲后被 NAT/conntrack 回收造成的“刷着刷着卡一下”。
+    sysctl -w net.ipv4.tcp_keepalive_time=120 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=30 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=3 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 || true
+}
+
+# 动态刷新服务限制：每次 start/restart/refresh-limits 都重写 unit/init 脚本，确保节点数量变化后限制立即更新。
+_refresh_dynamic_runtime_limits() {
+    local scope="${1:-all}"
+    [ "${SB_REFRESHING_RUNTIME_LIMITS:-0}" = "1" ] && return 0
+    export SB_REFRESHING_RUNTIME_LIMITS=1
+
+    _apply_low_mem_optimizations 2>/dev/null || true
+
+    if [ "$scope" = "all" ] || [ "$scope" = "sing-box" ]; then
+        if [ -n "$SERVICE_FILE" ] && [ -f "$SINGBOX_BIN" ]; then
+            if [ "$INIT_SYSTEM" = "systemd" ]; then
+                _create_systemd_service 2>/dev/null || true
+                systemctl daemon-reload 2>/dev/null || true
+            elif [ "$INIT_SYSTEM" = "openrc" ]; then
+                _create_openrc_service 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    if [ "$scope" = "all" ] || [ "$scope" = "xray" ]; then
+        if [ -f "/usr/local/bin/xray" ] && [ -s "/usr/local/etc/xray/config.json" ]; then
+            _create_xray_service_from_main 2>/dev/null || true
+        fi
+    fi
+
+    unset SB_REFRESHING_RUNTIME_LIMITS
+}
+
 
 # 安装阶段会产生较多文件缓存，低内存容器中尽力释放；失败不影响主流程
 _release_install_cache() {
@@ -370,11 +863,16 @@ export LOG_FILE="/var/log/sing-box.log"
 export PID_FILE="/tmp/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 _detect_init_system
-[ "$INIT_SYSTEM" == "openrc" ] && export SERVICE_FILE="/etc/init.d/sing-box" || export SERVICE_FILE="/etc/systemd/system/sing-box.service"
+case "$INIT_SYSTEM" in
+    openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
+    systemd) export SERVICE_FILE="/etc/systemd/system/sing-box.service" ;;
+    *) export SERVICE_FILE="" ;;
+esac
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name
+export -f _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
 
 export DEFAULT_SNI="$(_get_random_sni)"
+export MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
 server_ip=""
 BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
@@ -385,11 +883,9 @@ _install_dependencies() {
     # 可选依赖：部分功能需要，即使装失败也不致命
     local optional_pkgs="procps iptables socat iproute2 cron lsof"
     
-    # 针对不同发行版的 cron 包名适配
+    # Debian/Ubuntu 使用 cron，Alpine 使用 dcron
     if command -v apk &>/dev/null; then
         optional_pkgs="${optional_pkgs/cron/dcron}"
-    elif ! command -v apt-get &>/dev/null && ! command -v yum &>/dev/null && ! command -v dnf &>/dev/null; then
-        optional_pkgs="${optional_pkgs/cron/cronie}"
     fi
 
     _info "正在安装核心依赖..."
@@ -423,7 +919,7 @@ _install_dependencies() {
     done
     if [ -n "$missing" ]; then
         _error "以下关键依赖安装失败:${missing}"
-        _error "请使用系统包管理器手动安装这些工具（如 apk add / apt-get install / yum install）"
+        _error "请使用系统包管理器手动安装这些工具（Debian/Ubuntu: apt-get install；Alpine: apk add）"
         exit 1
     fi
 }
@@ -572,6 +1068,7 @@ _start_argo_tunnel() {
     # 基于端口生成独立的 PID 和日志文件路径
     local pid_file="/tmp/singbox_argo_${target_port}.pid"
     local log_file="/tmp/singbox_argo_${target_port}.log"
+    local cf_gomem=$(_get_cloudflared_gomem_limit 2>/dev/null || echo 64)
     
     _info "正在启动 Argo 隧道 (端口: $target_port)..." >&2
     
@@ -594,7 +1091,7 @@ _start_argo_tunnel() {
         
         # 强制锁定 protocol http2 (h2)，防止 QUIC (UDP) 被阻断导致连接失败
         # 增加 --no-autoupdate 防止在精简系统上因自更新导致的意外进程挂起
-        nohup ${CLOUDFLARED_BIN} tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
+        nohup env GOMEMLIMIT="${cf_gomem}MiB" GOGC=70 GOMAXPROCS=1 GODEBUG=madvdontneed=1 MALLOC_ARENA_MAX=1 "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
             
         local cf_pid=$!
         echo "$cf_pid" > "${pid_file}"
@@ -616,7 +1113,7 @@ _start_argo_tunnel() {
         _info "启动临时隧道，指向 127.0.0.1:${target_port}..." >&2
         
         # 优化：强制指定 http2 协议并禁用自动更新
-        nohup ${CLOUDFLARED_BIN} tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
+        nohup env GOMEMLIMIT="${cf_gomem}MiB" GOGC=70 GOMAXPROCS=1 GODEBUG=madvdontneed=1 MALLOC_ARENA_MAX=1 "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
             --logfile "${log_file}" \
             > /dev/null 2>&1 &
         
@@ -722,6 +1219,7 @@ _add_argo_node() {
         *) _error "不支持的 Argo 协议: $protocol"; return 1 ;;
     esac
 
+    _warn_lowmem_for_heavy_protocol "Argo/cloudflared"
     _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
 
     # 安装 cloudflared
@@ -968,6 +1466,7 @@ _add_argo_node() {
 
     # === [公共] 启用守护 + 显示结果 ===
     _enable_argo_watchdog
+    _refresh_dynamic_runtime_limits "all" 2>/dev/null || true
 
     echo ""
     _success "${protocol_label} + Argo 节点创建成功!"
@@ -1293,7 +1792,7 @@ _argo_keepalive() {
     local max_size=$((10 * 1024 * 1024))
     for log in "$LOG_FILE" /tmp/singbox_argo_*.log; do
         [ -e "$log" ] || continue
-        if [ -f "$log" ] && [ "$(stat -c%s "$log" 2>/dev/null || echo 0)" -ge "$max_size" ]; then
+        if [ -f "$log" ] && [ "$(_file_size_bytes "$log")" -ge "$max_size" ]; then
             tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
         fi
     done
@@ -1536,23 +2035,42 @@ _argo_menu() {
 # --- 服务与配置管理 ---
 
 _create_systemd_service() {
-    local mem_limit_mb=$(_get_mem_limit)
+    local mem_limit_mb=$(_get_runtime_profile_value gomem)
+    local gogc=$(_get_runtime_profile_value gogc)
+    local gomax=$(_get_runtime_profile_value gomax)
+    local nofile=$(_get_runtime_profile_value nofile)
+    local memhigh=$(_get_runtime_profile_value memhigh)
+    local memmax=$(_get_runtime_profile_value memmax)
+    local tasks=$(_get_runtime_profile_value tasks)
+    local mode=$(_get_runtime_profile_value mode)
     
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+StartLimitIntervalSec=0
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="GOGC=${gogc}"
+Environment="GOMAXPROCS=${gomax}"
+Environment="GODEBUG=madvdontneed=1"
+Environment="MALLOC_ARENA_MAX=1"
+Environment="SB_LOWMEM_MODE=${mode}"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
 Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=/bin/sh -c 'if [ -s "${SINGBOX_DIR}/relay.json" ]; then exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json"; else exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}"; fi'
 Restart=on-failure
-RestartSec=3s
-LimitNOFILE=infinity
+RestartSec=2s
+MemoryAccounting=true
+MemoryHigh=${memhigh}
+MemoryMax=${memmax}
+LimitNOFILE=${nofile}
+TasksMax=${tasks}
+OOMScoreAdjust=-900
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
@@ -1562,7 +2080,11 @@ EOF
 _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
-    local mem_limit_mb=$(_get_mem_limit)
+    local mem_limit_mb=$(_get_runtime_profile_value gomem)
+    local gogc=$(_get_runtime_profile_value gogc)
+    local gomax=$(_get_runtime_profile_value gomax)
+    local nofile=$(_get_runtime_profile_value nofile)
+    local mode=$(_get_runtime_profile_value mode)
     
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
@@ -1572,9 +2094,10 @@ command="/bin/sh"
 command_args='-c "if [ -s ${SINGBOX_DIR}/relay.json ]; then exec ${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json; else exec ${SINGBOX_BIN} run -c ${CONFIG_FILE}; fi"'
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${gogc} --env GOMAXPROCS=${gomax} --env GODEBUG=madvdontneed=1 --env MALLOC_ARENA_MAX=1 --env SB_LOWMEM_MODE=${mode} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
+rc_ulimit="-n ${nofile}"
 
 pidfile="${PID_FILE}"
 # supervise-daemon 自动将 stdout/stderr 重定向功能需要 openrc 版本支持
@@ -1592,6 +2115,7 @@ EOF
 
 _create_service_files() {
     
+    _apply_low_mem_optimizations
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         _create_systemd_service
@@ -2815,6 +3339,7 @@ _add_vless_tcp() {
 }
 
 _add_hysteria2() {
+    _warn_lowmem_for_heavy_protocol "Hysteria2"
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -4225,6 +4750,7 @@ _do_update_xray() {
         _success "Xray 首次安装完成并已启动！"
     else
         # 已安装：重启服务
+        _create_xray_service_from_main
         if command -v systemctl &>/dev/null && systemctl is-active xray &>/dev/null; then
             _info "正在重启 Xray 服务..."
             systemctl restart xray
@@ -4237,33 +4763,74 @@ _do_update_xray() {
     fi
 }
 
+# 收敛 Xray 日志配置，避免低内存小鸡被 access/debug 日志拖慢
+_apply_xray_low_mem_optimizations() {
+    local xray_dir="/usr/local/etc/xray"
+    local cfg="${xray_dir}/config.json"
+    local mem_mb=$(_get_total_mem_mb)
+    [ ! -s "$cfg" ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local log_level="warning"
+    [ "$mem_mb" -le 256 ] && log_level="error"
+
+    local tmp="${cfg}.tmp"
+    if jq --arg level "$log_level" '\n      .log = (.log // {}) |\n      .log.loglevel = $level |\n      .log.access = "none"\n    ' "$cfg" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$cfg"
+    else
+        rm -f "$tmp"
+    fi
+}
+
 # 从主脚本创建 Xray 服务文件 (内联实现)
 _create_xray_service_from_main() {
     local xray_bin="/usr/local/bin/xray"
     local xray_dir="/usr/local/etc/xray"
+    local mem_limit_mb=$(_get_runtime_profile_value gomem)
+    local gogc=$(_get_runtime_profile_value gogc)
+    local gomax=$(_get_runtime_profile_value gomax)
+    local nofile=$(_get_runtime_profile_value nofile)
+    local memhigh=$(_get_runtime_profile_value memhigh)
+    local memmax=$(_get_runtime_profile_value memmax)
+    local tasks=$(_get_runtime_profile_value tasks)
+    local mode=$(_get_runtime_profile_value mode)
+
+    _print_runtime_profile
+    _apply_xray_low_mem_optimizations 2>/dev/null || true
+
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        if [ ! -f "/etc/systemd/system/xray.service" ]; then
-            cat > /etc/systemd/system/xray.service << EOF
+        cat > /etc/systemd/system/xray.service << EOF
 [Unit]
 Description=Xray Service
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="GOGC=${gogc}"
+Environment="GOMAXPROCS=${gomax}"
+Environment="GODEBUG=madvdontneed=1"
+Environment="MALLOC_ARENA_MAX=1"
+Environment="SB_LOWMEM_MODE=${mode}"
 ExecStart=${xray_bin} run -c ${xray_dir}/config.json
 Restart=on-failure
-RestartSec=3
-LimitNOFILE=65535
+RestartSec=2
+MemoryAccounting=true
+MemoryHigh=${memhigh}
+MemoryMax=${memmax}
+LimitNOFILE=${nofile}
+TasksMax=${tasks}
+OOMScoreAdjust=-900
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            systemctl daemon-reload
-            systemctl enable xray
-        fi
+        systemctl daemon-reload
+        systemctl enable xray
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        if [ ! -f "/etc/init.d/xray" ]; then
-            cat > /etc/init.d/xray << 'EOF'
+        cat > /etc/init.d/xray << EOF
 #!/sbin/openrc-run
 name="xray"
 description="Xray Service"
@@ -4271,10 +4838,16 @@ command="/usr/local/bin/xray"
 command_args="run -c /usr/local/etc/xray/config.json"
 command_background=true
 pidfile="/run/xray.pid"
+rc_ulimit="-n ${nofile}"
+export GOMEMLIMIT="${mem_limit_mb}MiB"
+export GOGC="${gogc}"
+export GOMAXPROCS="${gomax}"
+export GODEBUG="madvdontneed=1"
+export MALLOC_ARENA_MAX="1"
+export SB_LOWMEM_MODE="${mode}"
 EOF
-            chmod +x /etc/init.d/xray
-            rc-update add xray default 2>/dev/null
-        fi
+        chmod +x /etc/init.d/xray
+        rc-update add xray default 2>/dev/null
     fi
 }
 
@@ -4327,6 +4900,7 @@ _limit_xray_manager_protocols() {
             python3 - "$script_path" <<'PY_REMOVE_OLD_LIMIT'
 import re
 import sys
+import os
 from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text(errors="ignore")
@@ -4344,6 +4918,7 @@ PY_REMOVE_OLD_LIMIT
     fi
 
     if command -v python3 >/dev/null 2>&1; then
+        export XRAY_MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
         python3 - "$script_path" <<'PY_LIMIT_XRAY'
 import re
 import sys
@@ -4372,6 +4947,7 @@ _get_random_sni() {
     echo "${arr[$((rand % count))]}"
 }
 '''
+helper += '\nMAIN_SCRIPT_PATH="' + os.environ.get('XRAY_MAIN_SCRIPT_PATH', '/usr/local/bin/sb') + '"\n'
 text = re.sub(r'\n?# \[XRAY_RANDOM_SNI_HELPER\].*?^\}', '', text, flags=re.S | re.M)
 insert_at = 0
 if text.startswith('#!'):
@@ -4482,8 +5058,8 @@ _xray_add_node_menu() {
         fi
 
         case $choice in
-            1) _add_vless_reality_vision && _manage_xray_service "restart" ;;
-            2) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
+            1) _add_vless_reality_vision && [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1; _manage_xray_service "restart" ;;
+            2) _add_shadowsocks_xray && [ -n "$MAIN_SCRIPT_PATH" ] && bash "$MAIN_SCRIPT_PATH" refresh-limits >/dev/null 2>&1; _manage_xray_service "restart" ;;
             0) return ;;
             *) _error "该协议已删除。当前只允许创建：[1] VLESS+TCP+Reality+Vision、[2] Shadowsocks。" ;;
         esac
@@ -5136,8 +5712,14 @@ _show_add_node_menu() {
 # --- 脚本入口 ---
 
 main() {
+    _assert_supported_os
     _check_root
     _detect_init_system
+    if [ "$INIT_SYSTEM" = "unknown" ]; then
+        _error "未检测到可用的 systemd 或 OpenRC，无法创建/管理服务。"
+        _error "请使用 Debian/Ubuntu(systemd) 或 Alpine(OpenRC)。"
+        exit 1
+    fi
     
     # 强制预创建目录，防止后续 cp/mv 因路径不存在报错 (保底机制)
     mkdir -p "${SINGBOX_DIR}" 2>/dev/null
@@ -5206,8 +5788,9 @@ main() {
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
         fi
 
-        # 4. 确保服务文件已创建
+        # 4. 确保服务文件已创建，并刷新所有动态资源限制
         _create_service_files
+        _refresh_dynamic_runtime_limits "all" 2>/dev/null || true
     else
         # --- sing-box 未安装：仅显示提示，不自动安装 ---
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
@@ -5221,6 +5804,39 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         keepalive)
             _argo_keepalive
+            exit 0
+            ;;
+        check-os|doctor)
+            _assert_supported_os
+            _detect_init_system
+            echo "OS: $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Linux})"
+            echo "Supported: $(_detect_supported_distro)"
+            echo "Init: ${INIT_SYSTEM}"
+            echo "Arch: $(uname -m)"
+            echo "Bash: ${BASH_VERSION}"
+            echo "Memory: $(_get_total_mem_mb) MB"
+            for c in bash curl wget jq openssl tar ip ss; do command -v "$c" >/dev/null 2>&1 && echo "OK: $c" || echo "MISS: $c"; done
+            exit 0
+            ;;
+        continuity-mode|protect-connectivity)
+            _check_root
+            export SB_STABILITY_MODE="continuity"
+            _detect_init_system
+            _refresh_dynamic_runtime_limits "all"
+            _success "已启用保连通优先策略。"
+            exit 0
+            ;;
+        refresh-limits|sync-limits)
+            _check_root
+            _detect_init_system
+            mkdir -p "${SINGBOX_DIR}" 2>/dev/null
+            _refresh_dynamic_runtime_limits "all"
+            _success "动态资源限制已刷新。"
+            exit 0
+            ;;
+        show-limits)
+            _detect_init_system
+            _print_runtime_profile
             exit 0
             ;;
         *)
