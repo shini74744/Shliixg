@@ -4316,11 +4316,12 @@ _advanced_features() {
 
 
 # 限制 Xray 子脚本的创建协议：只保留 [1] VLESS+TCP+Reality+Vision 与 [2] Shadowsocks
+# 同时修复 Xray 添加节点中的 SNI：用户回车时从 DEFAULT_SNI_POOL 随机选择。
 _limit_xray_manager_protocols() {
     local script_path="$1"
     [ -f "$script_path" ] || return 1
 
-    # 如果子脚本之前已被旧补丁改过，先移除旧的精简菜单块，避免保留 [8] 编号
+    # 如果子脚本之前已被旧补丁改过，先移除旧的精简菜单块，避免保留旧编号或旧 SNI 逻辑。
     if grep -q "# \[LIMITED_XRAY_CREATE_MENU\]" "$script_path" 2>/dev/null; then
         if command -v python3 >/dev/null 2>&1; then
             python3 - "$script_path" <<'PY_REMOVE_OLD_LIMIT'
@@ -4333,10 +4334,6 @@ text = re.sub(r'\n?# \[LIMITED_XRAY_CREATE_MENU\]\n_xray_add_node_menu\(\) \{.*?
 path.write_text(text)
 PY_REMOVE_OLD_LIMIT
         fi
-    fi
-
-    if grep -q "Xray 添加节点（精简版）" "$script_path" 2>/dev/null && grep -q "请选择 \[0/1/2\]" "$script_path" 2>/dev/null; then
-        return 0
     fi
 
     cp -f "$script_path" "${script_path}.bak.full" 2>/dev/null || true
@@ -4354,16 +4351,72 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text(errors="ignore")
-marker = "# [LIMITED_XRAY_CREATE_MENU]"
-if marker in text:
-    sys.exit(0)
 
-text = text.replace(
-    'local sni="www.amd.com" read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni sni=${custom_sni:-www.amd.com}',
-    'local sni="$(_get_random_sni 2>/dev/null || echo www.amd.com)" read -p "请输入伪装域名 SNI (回车随机): " custom_sni sni=${custom_sni:-$sni}'
+# 1) 给 xray_manager.sh 自身注入域名池和随机函数。
+helper = r'''
+# [XRAY_RANDOM_SNI_HELPER]
+export DEFAULT_SNI_POOL="${DEFAULT_SNI_POOL:-www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com}"
+_get_random_sni() {
+    local pool="${DEFAULT_SNI_POOL:-www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com}"
+    local arr=($pool)
+    local count=${#arr[@]}
+    if [ "$count" -le 0 ]; then
+        echo "www.amd.com"
+        return
+    fi
+    local rand
+    rand=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' ')
+    if ! [[ "$rand" =~ ^[0-9]+$ ]]; then
+        rand=$RANDOM
+    fi
+    echo "${arr[$((rand % count))]}"
+}
+'''
+text = re.sub(r'\n?# \[XRAY_RANDOM_SNI_HELPER\].*?^\}', '', text, flags=re.S | re.M)
+insert_at = 0
+if text.startswith('#!'):
+    first_nl = text.find('\n')
+    insert_at = first_nl + 1 if first_nl != -1 else 0
+text = text[:insert_at] + helper + "\n" + text[insert_at:]
+
+# 2) 强制替换常见的固定 SNI 默认写法。
+replacements = [
+    (r'local\s+sni="www\.amd\.com"', 'local sni="$(_get_random_sni)"'),
+    (r'local\s+server_name="www\.amd\.com"', 'local server_name="$(_get_random_sni)"'),
+    (r'local\s+shadowtls_sni="www\.amd\.com"', 'local shadowtls_sni="$(_get_random_sni)"'),
+    (r'sni=\$\{custom_sni:-www\.amd\.com\}', 'sni=${custom_sni:-$(_get_random_sni)}'),
+    (r'server_name=\$\{custom_sni:-www\.amd\.com\}', 'server_name=${custom_sni:-$(_get_random_sni)}'),
+    (r'shadowtls_sni=\$\{custom_sni:-www\.amd\.com\}', 'shadowtls_sni=${custom_sni:-$(_get_random_sni)}'),
+    (r'\$\{custom_sni:-www\.amd\.com\}', '${custom_sni:-$(_get_random_sni)}'),
+    (r'\$\{input_sni:-www\.amd\.com\}', '${input_sni:-$(_get_random_sni)}'),
+    (r'\$\{sni:-www\.amd\.com\}', '${sni:-$(_get_random_sni)}'),
+    (r'\$\{server_name:-www\.amd\.com\}', '${server_name:-$(_get_random_sni)}'),
+]
+for pat, rep in replacements:
+    text = re.sub(pat, rep, text)
+
+# 3) 把提示文案中的固定默认值改成“回车随机”。
+for old in ['默认: www.amd.com', '默认：www.amd.com', '默认 www.amd.com', '[默认: www.amd.com]', '[默认：www.amd.com]', '(默认: www.amd.com)', '(默认：www.amd.com)']:
+    text = text.replace(old, old.replace('默认: www.amd.com','回车随机').replace('默认：www.amd.com','回车随机').replace('默认 www.amd.com','回车随机').replace('[回车随机]','[回车随机]').replace('(回车随机)','(回车随机)'))
+text = text.replace('www.amd.com):', '回车随机):')
+text = text.replace('www.amd.com]:', '回车随机]:')
+
+# 4) 定点修复 read 后固定默认值的常见结构。
+text = re.sub(
+    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+(custom_sni|input_sni|sni|server_name)\s*\n\s*\[\[\s+-z\s+"\$\2"\s+\]\]\s*&&\s*\2=)"www\.amd\.com"',
+    r'\1"$(_get_random_sni)"',
+    text,
+    flags=re.M,
+)
+text = re.sub(
+    r'(read\s+-p\s+"[^"]*(?:SNI|伪装域名|域名)[^"]*"\s+(custom_sni|input_sni|sni|server_name)\s*\n\s*\2=\$\{\2:-)www\.amd\.com(\})',
+    r'\1$(_get_random_sni)\3',
+    text,
+    flags=re.M,
 )
 
-block = """
+# 5) 覆盖 Xray 添加节点菜单：只显示重新排序后的两个创建项。
+block = r'''
 # [LIMITED_XRAY_CREATE_MENU]
 _xray_add_node_menu() {
     while true; do
@@ -4394,8 +4447,8 @@ _xray_add_node_menu() {
         read -p "按回车键继续..."
     done
 }
-"""
-
+'''
+text = re.sub(r'\n?# \[LIMITED_XRAY_CREATE_MENU\]\n_xray_add_node_menu\(\) \{.*?^\}', '', text, flags=re.S | re.M)
 matches = list(re.finditer(r'(?m)^_xray_menu\s*$', text))
 if matches:
     idx = matches[-1].start()
@@ -4410,7 +4463,7 @@ path.write_text(text)
 PY_LIMIT_XRAY
         local rc=$?
         if [ "$rc" -ne 0 ]; then
-            _warn "Xray 创建菜单限制补丁应用失败，将拒绝进入 Xray 管理。"
+            _warn "Xray 创建菜单/SNI 随机补丁应用失败，将拒绝进入 Xray 管理。"
             return 1
         fi
         chmod +x "$script_path"
