@@ -1,16 +1,96 @@
-#!/usr/bin/env bash
+#!/bin/sh
+# POSIX bootstrap: 允许在 Alpine 精简系统上直接用 sh 运行；没有 bash 时会先优化 apk 源并安装 bash。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+
+    if [ -f /etc/alpine-release ] && command -v apk >/dev/null 2>&1; then
+        echo "[信息] 检测到 Alpine 精简系统，正在安装 bash/curl/证书并优化 apk 源..." >&2
+
+        xl_release="v$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)"
+        case "$xl_release" in
+            v[0-9]*.[0-9]*) ;;
+            *)
+                if grep -q '/edge/' /etc/apk/repositories 2>/dev/null; then xl_release="edge"; else xl_release="v3.21"; fi
+                ;;
+        esac
+
+        xl_timeout() {
+            sec="$1"; shift
+            if command -v timeout >/dev/null 2>&1; then
+                timeout "$sec" "$@"
+            else
+                "$@"
+            fi
+        }
+
+        xl_write_repos() {
+            base="$1"
+            mkdir -p /etc/apk 2>/dev/null || true
+            {
+                echo "$base/$xl_release/main"
+                echo "$base/$xl_release/community"
+            } > /etc/apk/repositories
+        }
+
+        cp /etc/apk/repositories "/etc/apk/repositories.xlddg.bak.$(date +%s 2>/dev/null || echo 0)" 2>/dev/null || true
+
+        xl_ok=0
+        # 先用 HTTP 走包签名校验，避免精简 Alpine 缺 CA 证书时 HTTPS 卡死；安装证书后主脚本会再使用 HTTPS/当前可用源。
+        for base in \
+            http://dl-cdn.alpinelinux.org/alpine \
+            http://mirrors.lax.silicloud.com/alpine \
+            http://us.mirror.ionos.com/linux/distributions/alpine \
+            http://eu.mirror.ionos.com/linux/distributions/alpine \
+            http://mirror.leaseweb.com/alpine \
+            http://ftp.halifax.rwth-aachen.de/alpine \
+            http://ftp.udx.icscoe.jp/Linux/alpine \
+            http://mirrors.tyo.silicloud.com/alpine \
+            http://mirror.jingk.ai/alpine \
+            http://mirror.freedif.org/alpine \
+            http://mirror.aarnet.edu.au/pub/alpine \
+            http://mirrors.aliyun.com/alpine; do
+            echo "[信息] 测试 Alpine 源: $base" >&2
+            xl_write_repos "$base"
+            if xl_timeout "${SB_APK_INDEX_TIMEOUT:-18}" apk update --no-progress >/dev/null 2>&1; then
+                echo "[成功] Alpine 源可用: $base" >&2
+                xl_ok=1
+                break
+            fi
+        done
+
+        if [ "$xl_ok" != "1" ]; then
+            echo "[错误] 所有内置 Alpine 源测试失败，请先检查 DNS/网络。" >&2
+            exit 1
+        fi
+
+        if ! xl_timeout "${SB_APK_ADD_TIMEOUT:-120}" apk add --no-progress bash curl wget ca-certificates coreutils openrc >/dev/null; then
+            echo "[错误] bash/curl/证书安装失败。" >&2
+            exit 1
+        fi
+        update-ca-certificates >/dev/null 2>&1 || true
+        mkdir -p /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+        exec bash "$0" "$@"
+    fi
+
+    echo "[错误] 当前系统缺少 bash。请先安装 bash 后再运行。" >&2
+    exit 1
+fi
+
 set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15.2-install-timeout-fix-debian-alpine"
+export SCRIPT_VERSION="15.5-quiet-download-progress-xlddg"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
-SELF_SCRIPT_PATH="$(readlink -f "$0")"
+SELF_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
-SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
+GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/55.sh}"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -22,6 +102,8 @@ export SB_STABILITY_MODE="${SB_STABILITY_MODE:-auto}"
 export SB_INSTALL_TIMEOUT="${SB_INSTALL_TIMEOUT:-180}"
 export SB_DOWNLOAD_TIMEOUT="${SB_DOWNLOAD_TIMEOUT:-90}"
 export SB_APT_LOCK_TIMEOUT="${SB_APT_LOCK_TIMEOUT:-30}"
+export SB_APK_INDEX_TIMEOUT="${SB_APK_INDEX_TIMEOUT:-18}"
+export SB_APK_ADD_TIMEOUT="${SB_APK_ADD_TIMEOUT:-120}"
 
 _with_timeout() {
     local seconds="$1"
@@ -30,7 +112,12 @@ _with_timeout() {
     start_ts=$(date +%s 2>/dev/null || echo 0)
     _info "执行命令(最长 ${seconds}s): $*"
     if command -v timeout >/dev/null 2>&1; then
-        timeout -k 5 "$seconds" "$@"
+        # BusyBox timeout 不支持 coreutils 的 -k 参数；低配 Alpine 首次运行时经常只有 BusyBox。
+        if timeout --help 2>&1 | grep -q -- ' -k '; then
+            timeout -k 5 "$seconds" "$@"
+        else
+            timeout "$seconds" "$@"
+        fi
         rc=$?
     else
         _warn "系统缺少 timeout 命令，无法强制超时；将直接执行: $*"
@@ -99,7 +186,7 @@ _assert_supported_os() {
         *)
             echo "[错误] 当前发行版不在支持范围内。" >&2
             echo "[错误] 当前脚本仅支持：Debian / Ubuntu / Alpine。" >&2
-            echo "[提示] 如需在 Alpine 上运行，请先执行：apk add bash" >&2
+            echo "[提示] Alpine 精简系统可直接用：wget -T 30 -O /tmp/55.sh <脚本URL> && sh /tmp/55.sh" >&2
             exit 1
             ;;
     esac
@@ -144,6 +231,86 @@ _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
+
+# 带标签的超时执行：避免把 GitHub 302 签名长链接刷满屏。
+_with_timeout_label() {
+    local seconds="$1"
+    local label="$2"
+    shift 2
+    local start_ts end_ts rc
+    start_ts=$(date +%s 2>/dev/null || echo 0)
+    _info "${label}(最长 ${seconds}s)"
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout --help 2>&1 | grep -q -- ' -k '; then
+            timeout -k 5 "$seconds" "$@"
+        else
+            timeout "$seconds" "$@"
+        fi
+        rc=$?
+    else
+        _warn "系统缺少 timeout 命令，无法强制超时；将直接执行：${label}"
+        "$@"
+        rc=$?
+    fi
+    end_ts=$(date +%s 2>/dev/null || echo 0)
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        _error "${label}超时退出(${seconds}s)"
+    else
+        _info "${label}结束(rc=${rc}, 用时约 $((end_ts-start_ts))s)"
+    fi
+    return "$rc"
+}
+
+# 统一下载函数：优先用 curl 进度条；fallback 到 wget 静默下载。
+# 不直接打印 URL，防止 GitHub release-assets 签名跳转链接刷屏。
+_download_file() {
+    local url="$1"
+    local output="$2"
+    local label="${3:-文件}"
+    local seconds="${4:-${SB_DOWNLOAD_TIMEOUT:-90}}"
+    local rc=1
+
+    rm -f "$output" 2>/dev/null || true
+    _info "正在下载 ${label}..."
+
+    if command -v curl >/dev/null 2>&1; then
+        local curl_args=(-fL --connect-timeout 10 --max-time "$seconds" --retry 1 --retry-delay 2 -o "$output")
+        if [ -t 2 ] && [ "${SB_DOWNLOAD_PROGRESS:-1}" != "0" ]; then
+            curl_args+=(--progress-bar)
+        else
+            curl_args+=(-sS)
+        fi
+        if _with_timeout_label "$seconds" "下载 ${label}" curl "${curl_args[@]}" "$url" && [ -s "$output" ]; then
+            _success "${label} 下载完成"
+            return 0
+        fi
+        rm -f "$output" 2>/dev/null || true
+        _warn "curl 下载 ${label} 失败，改用 wget 重试。"
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        local wget_args=(--timeout=20 --tries=2 -q -O "$output")
+        if wget --help 2>&1 | grep -q -- '--show-progress' && [ -t 2 ] && [ "${SB_DOWNLOAD_PROGRESS:-1}" != "0" ]; then
+            wget_args=(--timeout=20 --tries=2 -q --show-progress -O "$output")
+        fi
+        if _with_timeout_label "$seconds" "下载 ${label}" wget "${wget_args[@]}" "$url" && [ -s "$output" ]; then
+            _success "${label} 下载完成"
+            return 0
+        fi
+        rm -f "$output" 2>/dev/null || true
+
+        # BusyBox wget fallback：部分极简 Alpine 只支持 -T，不支持 --timeout。
+        if _with_timeout_label "$seconds" "下载 ${label}" wget -T 20 -q -O "$output" "$url" && [ -s "$output" ]; then
+            _success "${label} 下载完成"
+            return 0
+        fi
+        rm -f "$output" 2>/dev/null || true
+    fi
+
+    _error "${label} 下载失败或文件为空"
+    [ "${SB_VERBOSE_DOWNLOAD:-0}" = "1" ] && _error "失败 URL: $url"
+    return 1
+}
 
 # 检查 root 权限
 _check_root() {
@@ -311,6 +478,120 @@ _manage_service() {
     esac
 }
 
+# Alpine 全球镜像自适应：避免 dl-cdn.alpinelinux.org 在部分 NAT/海外线路上长时间卡住。
+_alpine_release_branch() {
+    local release=""
+    if [ -f /etc/alpine-release ]; then
+        release="v$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)"
+    fi
+    if [[ ! "$release" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+        if grep -q '/edge/' /etc/apk/repositories 2>/dev/null; then
+            release="edge"
+        else
+            release="v3.21"
+        fi
+    fi
+    echo "$release"
+}
+
+_alpine_current_repo_bases() {
+    local release="$(_alpine_release_branch)"
+    [ -f /etc/apk/repositories ] || return 0
+    awk -v rel="$release" '
+        $0 ~ /^https?:\/\// {
+            line=$0
+            sub("/" rel "/main.*$", "", line)
+            sub("/" rel "/community.*$", "", line)
+            sub("/edge/main.*$", "", line)
+            sub("/edge/community.*$", "", line)
+            if (line ~ /^https?:\/\//) print line
+        }
+    ' /etc/apk/repositories 2>/dev/null | awk '!seen[$0]++'
+}
+
+_alpine_candidate_repo_bases() {
+    if [ -n "${SB_APK_MIRRORS:-}" ]; then
+        printf '%s\n' ${SB_APK_MIRRORS}
+        return 0
+    fi
+
+    _alpine_current_repo_bases
+    cat <<'EOF'
+https://dl-cdn.alpinelinux.org/alpine
+http://dl-cdn.alpinelinux.org/alpine
+https://mirrors.lax.silicloud.com/alpine
+http://mirrors.lax.silicloud.com/alpine
+https://us.mirror.ionos.com/linux/distributions/alpine
+http://us.mirror.ionos.com/linux/distributions/alpine
+https://eu.mirror.ionos.com/linux/distributions/alpine
+http://eu.mirror.ionos.com/linux/distributions/alpine
+https://mirror.leaseweb.com/alpine
+http://mirror.leaseweb.com/alpine
+https://ftp.halifax.rwth-aachen.de/alpine
+http://ftp.halifax.rwth-aachen.de/alpine
+https://ftp.udx.icscoe.jp/Linux/alpine
+http://ftp.udx.icscoe.jp/Linux/alpine
+https://mirrors.tyo.silicloud.com/alpine
+http://mirrors.tyo.silicloud.com/alpine
+https://mirror.jingk.ai/alpine
+http://mirror.jingk.ai/alpine
+https://mirror.freedif.org/alpine
+http://mirror.freedif.org/alpine
+https://mirror.aarnet.edu.au/pub/alpine
+http://mirror.aarnet.edu.au/pub/alpine
+https://mirrors.aliyun.com/alpine
+http://mirrors.aliyun.com/alpine
+EOF
+}
+
+_alpine_write_repositories() {
+    local base="$1"
+    local release="$(_alpine_release_branch)"
+    mkdir -p /etc/apk 2>/dev/null || true
+    {
+        echo "${base}/${release}/main"
+        echo "${base}/${release}/community"
+    } > /etc/apk/repositories
+}
+
+_alpine_prepare_repositories() {
+    command -v apk >/dev/null 2>&1 || return 0
+    local force="${1:-}"
+    local state_file="/tmp/.xlddg_apk_repo_ready"
+    if [ "$force" != "force" ] && [ -f "$state_file" ]; then
+        return 0
+    fi
+
+    local backup="/etc/apk/repositories.xlddg.bak.$(date +%s 2>/dev/null || echo 0)"
+    cp /etc/apk/repositories "$backup" 2>/dev/null || true
+
+    local base seen_file="/tmp/.xlddg_apk_repo_seen.$$"
+    : > "$seen_file"
+    while IFS= read -r base; do
+        [ -n "$base" ] || continue
+        grep -Fxq "$base" "$seen_file" 2>/dev/null && continue
+        echo "$base" >> "$seen_file"
+        _info "测试 Alpine 软件源: ${base}"
+        _alpine_write_repositories "$base"
+        if _with_timeout "${SB_APK_INDEX_TIMEOUT:-18}" apk update --no-progress >/dev/null 2>&1; then
+            rm -f "$seen_file"
+            echo "$base" > "$state_file" 2>/dev/null || true
+            _success "已选择 Alpine 软件源: ${base}"
+            return 0
+        fi
+        _warn "该 Alpine 源不可用或超时，切换下一个。"
+    done <<EOF
+$(_alpine_candidate_repo_bases)
+EOF
+    rm -f "$seen_file"
+
+    if [ -s "$backup" ]; then
+        cp -f "$backup" /etc/apk/repositories 2>/dev/null || true
+    fi
+    _error "所有内置 Alpine 软件源均不可用，请检查 DNS/网络或设置 SB_APK_MIRRORS。"
+    return 1
+}
+
 # 智能包管理
 _pkg_install() {
     local pkgs="$*"
@@ -319,9 +600,15 @@ _pkg_install() {
     _assert_supported_os
 
     if command -v apk >/dev/null 2>&1; then
-        pkgs="${pkgs/cron/dcron}"
+        pkgs="${pkgs//cron/dcron}"
         _info "apk 安装: $pkgs"
-        _with_timeout "$SB_INSTALL_TIMEOUT" apk add --no-cache $pkgs
+        _alpine_prepare_repositories || return 1
+        _with_timeout "${SB_APK_ADD_TIMEOUT:-120}" apk add --no-progress $pkgs || {
+            _warn "apk add 失败，强制重新选择 Alpine 软件源后重试一次。"
+            rm -f /tmp/.xlddg_apk_repo_ready 2>/dev/null || true
+            _alpine_prepare_repositories force || return 1
+            _with_timeout "${SB_APK_ADD_TIMEOUT:-120}" apk add --no-progress $pkgs
+        }
     elif command -v apt-get >/dev/null 2>&1; then
         _info "apt 安装: $pkgs"
         local apt_common=(
@@ -878,17 +1165,76 @@ _install_yq() {
         _info "安装 yq..."
         local arch=$(uname -m)
         case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
-        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
+        if ! _download_file "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" "$YQ_BINARY" "yq" "$SB_DOWNLOAD_TIMEOUT"; then
             rm -f "$YQ_BINARY"
-            _warn "wget 下载 yq 失败，改用 curl 重试。"
-            if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch" || [ ! -s "$YQ_BINARY" ]; then
-                rm -f "$YQ_BINARY"
-                _error "yq 下载失败或文件为空"
-                return 1
-            fi
+            return 1
         fi
         chmod +x "$YQ_BINARY"
     fi
+}
+
+
+# Alpine 首次运行引导：先补齐证书、timeout 和 OpenRC，避免进入主流程前卡死或误判 init。
+_alpine_bootstrap_before_init() {
+    command -v apk >/dev/null 2>&1 || return 0
+
+    local bootstrap_pkgs=""
+    command -v timeout >/dev/null 2>&1 || bootstrap_pkgs="$bootstrap_pkgs coreutils"
+    command -v update-ca-certificates >/dev/null 2>&1 || bootstrap_pkgs="$bootstrap_pkgs ca-certificates"
+    command -v rc-service >/dev/null 2>&1 || bootstrap_pkgs="$bootstrap_pkgs openrc"
+
+    if [ -n "$bootstrap_pkgs" ]; then
+        _info "Alpine 首次运行预检，补齐基础组件:$bootstrap_pkgs"
+        _pkg_install $bootstrap_pkgs || return 1
+    fi
+
+    command -v update-ca-certificates >/dev/null 2>&1 && update-ca-certificates >/dev/null 2>&1 || true
+
+    # LXC/容器里的 Alpine 可能没有完整启动 OpenRC，但 rc-service 需要 softlevel 文件。
+    if command -v rc-service >/dev/null 2>&1; then
+        mkdir -p /run/openrc 2>/dev/null || true
+        touch /run/openrc/softlevel 2>/dev/null || true
+    fi
+}
+
+# 安装命令行呼出入口：执行 xlddg 即可再次打开脚本。
+_install_cli_shortcut() {
+    local shortcut="/usr/local/bin/xlddg"
+    mkdir -p /usr/local/bin 2>/dev/null || return 1
+
+    if [ "$SELF_SCRIPT_PATH" = "$shortcut" ]; then
+        chmod +x "$shortcut" 2>/dev/null || true
+        return 0
+    fi
+
+    if [ -f "$SELF_SCRIPT_PATH" ] && [ -s "$SELF_SCRIPT_PATH" ]; then
+        if ! cmp -s "$SELF_SCRIPT_PATH" "$shortcut" 2>/dev/null; then
+            cp -f "$SELF_SCRIPT_PATH" "$shortcut" || return 1
+        fi
+        chmod +x "$shortcut" 2>/dev/null || true
+        _success "快捷命令已安装：xlddg"
+        return 0
+    fi
+
+    _warn "无法从当前运行路径复制脚本，快捷命令 xlddg 暂未安装。建议先保存脚本文件后再运行。"
+    return 1
+}
+
+# 按需补 cron，避免安装阶段无脑安装 dcron 导致 Alpine 小鸡卡住。
+_ensure_cron_available() {
+    if command -v crontab >/dev/null 2>&1; then
+        return 0
+    fi
+
+    _info "未检测到 crontab，正在按需安装 cron/dcron..."
+    _pkg_install cron || return 1
+
+    if command -v apk >/dev/null 2>&1 && command -v crond >/dev/null 2>&1; then
+        _with_timeout 15 rc-service dcron start 2>/dev/null || true
+        _with_timeout 15 rc-update add dcron default 2>/dev/null || true
+    fi
+
+    command -v crontab >/dev/null 2>&1
 }
 
 # --- 核心变量定义 ---
@@ -909,7 +1255,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _with_timeout _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning
+export -f _with_timeout _with_timeout_label _download_file _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _alpine_release_branch _alpine_current_repo_bases _alpine_candidate_repo_bases _alpine_write_repositories _alpine_prepare_repositories _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning _alpine_bootstrap_before_init _install_cli_shortcut _ensure_cron_available
 
 export DEFAULT_SNI="$(_get_random_sni)"
 export MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
@@ -918,41 +1264,44 @@ BATCH_MODE=false
 trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
 # 依赖安装
 _install_dependencies() {
-    # 核心依赖：脚本运行的绝对前提，必须全部装上
-    local core_pkgs="curl jq openssl wget tar"
-    # 可选依赖：部分功能需要，即使装失败也不致命
-    local optional_pkgs="procps iptables socat iproute2 cron lsof"
-    
-    # Debian/Ubuntu 使用 cron，Alpine 使用 dcron
-    if command -v apk &>/dev/null; then
-        optional_pkgs="${optional_pkgs/cron/dcron}"
+    # 只安装缺失的核心依赖，避免每次进入菜单都触发 apk/apt 网络访问。
+    local core_pkgs=""
+    command -v curl >/dev/null 2>&1 || core_pkgs="$core_pkgs curl"
+    command -v jq >/dev/null 2>&1 || core_pkgs="$core_pkgs jq"
+    command -v openssl >/dev/null 2>&1 || core_pkgs="$core_pkgs openssl"
+    command -v wget >/dev/null 2>&1 || core_pkgs="$core_pkgs wget"
+    command -v tar >/dev/null 2>&1 || core_pkgs="$core_pkgs tar"
+    command -v timeout >/dev/null 2>&1 || core_pkgs="$core_pkgs coreutils"
+    command -v update-ca-certificates >/dev/null 2>&1 || core_pkgs="$core_pkgs ca-certificates"
+
+    if [ -n "$core_pkgs" ]; then
+        _info "正在安装缺失的核心依赖:$core_pkgs"
+        _pkg_install $core_pkgs || {
+            _error "核心依赖安装失败，无法继续。"
+            exit 1
+        }
+    else
+        _info "核心依赖已存在，跳过包管理器安装。"
     fi
 
-    _info "正在安装核心依赖..."
-    _pkg_install $core_pkgs
-    
-    _info "正在安装可选依赖..."
-    _pkg_install $optional_pkgs 2>/dev/null || {
-        # 可选依赖批量安装失败时（如 iptables 冲突），逐个尝试
-        _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
-        for pkg in $optional_pkgs; do
-            _pkg_install "$pkg" 2>/dev/null || true
-        done
+    command -v update-ca-certificates >/dev/null 2>&1 && update-ca-certificates >/dev/null 2>&1 || true
+
+    # 可选依赖只保留低风险、常用项；iptables/cron/lsof/socat 改为功能触发时按需安装，减少 Alpine 安装卡顿。
+    local optional_pkgs=""
+    command -v ip >/dev/null 2>&1 || optional_pkgs="$optional_pkgs iproute2"
+    if [ -n "$optional_pkgs" ]; then
+        _info "正在安装缺失的可选基础依赖:$optional_pkgs"
+        _pkg_install $optional_pkgs 2>/dev/null || _warn "部分可选基础依赖安装失败，相关功能可能受限。"
+    fi
+
+    _install_yq || {
+        _error "yq 安装失败，无法继续。"
+        exit 1
     }
-    
-    _install_yq
-
-    # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
-    if command -v apk &>/dev/null; then
-        if command -v crond &>/dev/null; then
-            _with_timeout 15 rc-service dcron start 2>/dev/null || true
-            _with_timeout 15 rc-update add dcron default 2>/dev/null || true
-        fi
-    fi
 
     # 关键依赖验证：如果核心工具缺失则无法继续
     local missing=""
-    for cmd in jq curl wget openssl tar; do
+    for cmd in jq curl wget openssl tar timeout; do
         if ! command -v "$cmd" &>/dev/null; then
             missing="$missing $cmd"
         fi
@@ -1017,7 +1366,7 @@ _install_sing_box() {
     
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local release_info=$(_with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null || true)
+    local release_info=$(_with_timeout_label "$SB_DOWNLOAD_TIMEOUT" "获取 sing-box 最新版本信息" curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null || true)
     local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
 
     if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
@@ -1025,15 +1374,9 @@ _install_sing_box() {
     temp_dir=$(mktemp -d /root/.singbox-install.XXXXXX) || { _error "创建临时目录失败。"; return 1; }
     archive_path="${temp_dir}/sing-box.tar.gz"
 
-    _info "正在下载 sing-box 安装包..."
-    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
-        rm -f "$archive_path"
-        _warn "wget 下载 sing-box 失败，改用 curl 重试。"
-        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "$archive_path" "$download_url" || [ ! -s "$archive_path" ]; then
-            _error "下载失败或文件为空: $download_url"
-            rm -rf "$temp_dir"
-            return 1
-        fi
+    if ! _download_file "$download_url" "$archive_path" "sing-box 安装包" "$SB_DOWNLOAD_TIMEOUT"; then
+        rm -rf "$temp_dir"
+        return 1
     fi
 
     _info "正在解压 sing-box 安装包..."
@@ -1092,14 +1435,9 @@ _install_cloudflared() {
     
     local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch_tag}"
     
-    if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" wget --timeout=20 --tries=2 --progress=dot:giga -O "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
+    if ! _download_file "$download_url" "${CLOUDFLARED_BIN}" "cloudflared" "$SB_DOWNLOAD_TIMEOUT"; then
         rm -f "${CLOUDFLARED_BIN}"
-        _warn "wget 下载 cloudflared 失败，改用 curl 重试。"
-        if ! _with_timeout "$SB_DOWNLOAD_TIMEOUT" curl -fL --connect-timeout 10 --max-time "$SB_DOWNLOAD_TIMEOUT" -o "${CLOUDFLARED_BIN}" "$download_url" || [ ! -s "${CLOUDFLARED_BIN}" ]; then
-            rm -f "${CLOUDFLARED_BIN}"
-            _error "cloudflared 下载失败或文件为空!"
-            return 1
-        fi
+        return 1
     fi
     chmod +x "${CLOUDFLARED_BIN}"
     
@@ -1902,6 +2240,10 @@ _argo_keepalive() {
 }
 
 _enable_argo_watchdog() {
+    _ensure_cron_available || {
+        _warning "crontab 不可用，Argo Watchdog 未启用。"
+        return 1
+    }
     # 检查 crontab 是否已有任务
     local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
     
@@ -2207,6 +2549,7 @@ _uninstall() {
     [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
     [ -f "/usr/local/bin/xray" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
+    echo -e "  ${RED}-${NC} 快捷命令: /usr/local/bin/xlddg"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
     
@@ -2296,7 +2639,7 @@ _uninstall() {
     _info "正在清理周边环境..."
     rm -f "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh" "${SINGBOX_DIR}/xray_manager.sh"
     rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
-    rm -f "/usr/local/bin/sb"
+    rm -f "/usr/local/bin/sb" "/usr/local/bin/xlddg"
     
     # 5. 复原 MOTD
     if [ -f "/etc/motd" ]; then
@@ -4614,7 +4957,7 @@ _update_script() {
     _info "正在从 GitHub 下载最新版本..."
     local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
     
-    if wget -qO "$temp_script_path" "$SCRIPT_UPDATE_URL"; then
+    if _download_file "$SCRIPT_UPDATE_URL" "$temp_script_path" "主脚本更新包" "$SB_DOWNLOAD_TIMEOUT"; then
         if [ ! -s "$temp_script_path" ]; then
             _error "主脚本下载失败或文件为空！"
             rm -f "$temp_script_path"
@@ -4623,6 +4966,7 @@ _update_script() {
         
         chmod +x "$temp_script_path"
         mv "$temp_script_path" "$SELF_SCRIPT_PATH"
+        _install_cli_shortcut 2>/dev/null || true
         _success "主脚本 (singbox.sh) 更新成功！"
     else
         _error "主脚本下载失败！请检查网络或 GitHub 链接。"
@@ -4644,7 +4988,7 @@ _update_script() {
                 local temp_sub_path="${script_path}.tmp"
                 
                 _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-                if wget -qO "$temp_sub_path" "$script_url"; then
+                if _download_file "$script_url" "$temp_sub_path" "子脚本 ${script_name}" "$SB_DOWNLOAD_TIMEOUT"; then
                     if [ -s "$temp_sub_path" ]; then
                         chmod +x "$temp_sub_path"
                         mv "$temp_sub_path" "$script_path"
@@ -4668,6 +5012,7 @@ _update_script() {
     _success "所有脚本组件已更新至最新版 (v${SCRIPT_VERSION})！"
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
+    echo -e "${YELLOW}或直接执行：xlddg${NC}"
     exit 0
 }
 
@@ -4753,9 +5098,7 @@ _do_update_xray() {
     local tmp_dir=$(mktemp -d)
     local tmp_zip="${tmp_dir}/xray.zip"
     
-    _info "下载地址: ${download_url}"
-    if ! wget -qO "$tmp_zip" "$download_url"; then
-        _error "Xray 下载失败！"
+    if ! _download_file "$download_url" "$tmp_zip" "Xray 核心" "$SB_DOWNLOAD_TIMEOUT"; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -4914,7 +5257,7 @@ _advanced_features() {
         _info "本地未检测到进阶脚本，正在尝试下载..."
         local download_url="${GITHUB_RAW_BASE}/${script_name}"
         
-        if wget -qO "$script_path" "$download_url"; then
+        if _download_file "$download_url" "$script_path" "脚本 ${script_name}" "$SB_DOWNLOAD_TIMEOUT"; then
             chmod +x "$script_path"
             _success "下载成功！"
         else
@@ -5160,7 +5503,7 @@ _xray_features() {
     if [ ! -f "$script_path" ]; then
         _info "本地未检测到 Xray 管理脚本，正在尝试下载..."
         local download_url="${GITHUB_RAW_BASE}/${script_name}"
-        if wget -qO "$script_path" "$download_url"; then
+        if _download_file "$download_url" "$script_path" "脚本 ${script_name}" "$SB_DOWNLOAD_TIMEOUT"; then
             chmod +x "$script_path"
             _success "下载成功！"
         else
@@ -5762,17 +6105,22 @@ _show_add_node_menu() {
 main() {
     _assert_supported_os
     _check_root
+
+    # 强制预创建目录，防止后续 cp/mv 因路径不存在报错 (保底机制)
+    mkdir -p "${SINGBOX_DIR}" 2>/dev/null
+
+    # Alpine 先补齐 OpenRC/证书/timeout，再检测 init，避免精简小鸡直接退出。
+    _alpine_bootstrap_before_init || exit 1
     _detect_init_system
     if [ "$INIT_SYSTEM" = "unknown" ]; then
         _error "未检测到可用的 systemd 或 OpenRC，无法创建/管理服务。"
         _error "请使用 Debian/Ubuntu(systemd) 或 Alpine(OpenRC)。"
         exit 1
     fi
+
+    _install_cli_shortcut 2>/dev/null || true
     
-    # 强制预创建目录，防止后续 cp/mv 因路径不存在报错 (保底机制)
-    mkdir -p "${SINGBOX_DIR}" 2>/dev/null
-    
-    # 1. 始终检查依赖
+    # 1. 检查并安装缺失依赖
     _install_dependencies
     
     # 获取归口后的公网 IP (在依赖检查后执行以确保 curl 可用)
@@ -5856,6 +6204,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         check-os|doctor)
             _assert_supported_os
+            _alpine_bootstrap_before_init 2>/dev/null || true
             _detect_init_system
             echo "OS: $(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Linux})"
             echo "Supported: $(_detect_supported_distro)"
@@ -5863,7 +6212,8 @@ while [[ $# -gt 0 ]]; do
             echo "Arch: $(uname -m)"
             echo "Bash: ${BASH_VERSION}"
             echo "Memory: $(_get_total_mem_mb) MB"
-            for c in bash curl wget jq openssl tar ip ss; do command -v "$c" >/dev/null 2>&1 && echo "OK: $c" || echo "MISS: $c"; done
+            for c in bash curl wget jq openssl tar timeout update-ca-certificates ip ss rc-service xlddg; do command -v "$c" >/dev/null 2>&1 && echo "OK: $c" || echo "MISS: $c"; done
+            if command -v apk >/dev/null 2>&1; then echo "--- /etc/apk/repositories ---"; cat /etc/apk/repositories 2>/dev/null || true; fi
             exit 0
             ;;
         continuity-mode|protect-connectivity)
