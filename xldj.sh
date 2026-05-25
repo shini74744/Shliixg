@@ -83,14 +83,14 @@ set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15.5-quiet-download-progress-xlddg"
+export SCRIPT_VERSION="15.7-shlii-brand-shortcut-tip"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main}"
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/55.sh}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/xldj.sh}"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
 export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
@@ -138,6 +138,7 @@ _with_timeout() {
 
 # 颜色定义
 RED='\033[0;31m'
+BLUE='\033[0;34m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
@@ -1213,6 +1214,7 @@ _install_cli_shortcut() {
         fi
         chmod +x "$shortcut" 2>/dev/null || true
         _success "快捷命令已安装：xlddg"
+        _info "后续可直接在终端输入 xlddg 呼出本脚本菜单。"
         return 0
     fi
 
@@ -5541,6 +5543,14 @@ _main_menu() {
         echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}         ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
+        echo -e "  ${BLUE}平台官网：Shlii.io${NC}"
+        echo -e "  ${CYAN}快捷呼出：${YELLOW}xlddg${NC}"
+        echo -e "  ${CYAN}安装完成后，终端输入 ${YELLOW}xlddg${CYAN} 可再次打开本脚本${NC}"
+        echo ""
+        echo -e "  ${RED}禁止测速${NC}"
+        echo -e "  ${RED}禁止滥用${NC}"
+        echo -e "  ${RED}禁止机场接入${NC}"
+        echo -e "  ${RED}禁止风险操作${NC}"
         echo ""
         
         # 获取系统信息
