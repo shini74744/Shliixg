@@ -1,29 +1,33 @@
 #!/usr/bin/env bash
 # nezhajc.sh
-# Read-only security check for Incus/LXC host and containers.
-# Focus:
-#   1. Check containers with Nezha agent installed.
-#   2. Mark container as INFECTED if public remote IP count or public connection count >= 1000.
-#   3. Host is NOT marked infected only because container-mapped UID 1000000 has suspicious processes.
+# 母机 + Incus/LXC 小鸡感染痕迹检测脚本
+# 只读检测：不删除、不杀进程、不修改配置
 #
-# Usage:
+# 重点：
+#   1. 重点检查安装/运行哪吒监控的小鸡
+#   2. 小鸡公网远端 IP 数或公网连接数 >= 1000 时标记为疑似感染
+#   3. 母机不会因为 UID 1000000 这类容器映射用户出现可疑进程就直接判感染
+#
+# 用法：
 #   bash nezhajc.sh
 #   bash nezhajc.sh --host-only
 #   bash nezhajc.sh --nezha-only
+#   bash nezhajc.sh --no-color
 #
-# Env:
+# 环境变量：
 #   CONN_THRESHOLD=1000 bash nezhajc.sh
 #
-# Exit code:
-#   0 = no obvious signs
-#   1 = warnings found
-#   2 = high-risk / infected signs found
+# 退出码：
+#   0 = 未发现明显感染痕迹
+#   1 = 存在可疑项，需要人工确认
+#   2 = 存在高危/疑似感染项
 
 set +e
 export LC_ALL=C
 
 SCAN_CONTAINER=1
 NEZHA_ONLY=0
+USE_COLOR=1
 CONN_THRESHOLD="${CONN_THRESHOLD:-1000}"
 
 for arg in "$@"; do
@@ -34,20 +38,24 @@ for arg in "$@"; do
     --nezha-only)
       NEZHA_ONLY=1
       ;;
+    --no-color)
+      USE_COLOR=0
+      ;;
     -h|--help)
       cat <<HELP
-Usage:
+用法：
   bash nezhajc.sh
   bash nezhajc.sh --host-only
   bash nezhajc.sh --nezha-only
+  bash nezhajc.sh --no-color
 
-Env:
+环境变量：
   CONN_THRESHOLD=1000 bash nezhajc.sh
 
-Exit code:
-  0 = no obvious signs
-  1 = warning signs found
-  2 = high-risk or infected signs found
+退出码：
+  0 = 未发现明显感染痕迹
+  1 = 存在可疑项，需要人工确认
+  2 = 存在高危/疑似感染项
 HELP
       exit 0
       ;;
@@ -59,6 +67,20 @@ TIME="$(date +%F-%H%M%S)"
 REPORT="/root/nezhajc_${HOST}_${TIME}.log"
 
 exec > >(tee -a "$REPORT") 2>&1
+
+if [ "$USE_COLOR" -eq 1 ]; then
+  RED="\033[31m"
+  YELLOW="\033[33m"
+  GREEN="\033[32m"
+  BLUE="\033[36m"
+  NC="\033[0m"
+else
+  RED=""
+  YELLOW=""
+  GREEN=""
+  BLUE=""
+  NC=""
+fi
 
 HOST_HIGH=0
 HOST_WARN=0
@@ -84,26 +106,38 @@ URL_EXEC_RE='http://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|https://[0-9]+\.[0-9]+\.[0-9]
 
 section() {
   echo
-  echo "================ $* ================"
+  echo -e "${BLUE}================ $* ================${NC}"
+}
+
+ok() {
+  echo -e "${GREEN}[OK] $*${NC}"
+}
+
+warn() {
+  echo -e "${YELLOW}[WARN] $*${NC}"
+}
+
+high() {
+  echo -e "${RED}[HIGH] $*${NC}"
 }
 
 host_high() {
   HOST_HIGH=1
-  echo "[HOST-HIGH] $*"
+  high "$*"
 }
 
 host_warn() {
   HOST_WARN=1
-  echo "[HOST-WARN] $*"
+  warn "$*"
 }
 
 host_ok() {
-  echo "[HOST-OK] $*"
+  ok "$*"
 }
 
 escape_risk() {
   ESCAPE_RISK=1
-  echo "[ESCAPE-RISK] $*"
+  high "$*"
 }
 
 container_infected() {
@@ -113,15 +147,15 @@ container_infected() {
 
   CONTAINER_INFECTED_COUNT=$((CONTAINER_INFECTED_COUNT + 1))
   INFECTED_LIST="${INFECTED_LIST}
-[INFECTED] ${name} | NEZHA:${nezha_flag} | REASON:${reason}"
+[疑似感染] ${name} | 哪吒:${nezha_flag} | 原因:${reason}"
 
-  if [ "$nezha_flag" = "YES" ]; then
+  if [ "$nezha_flag" = "是" ]; then
     CONTAINER_NEZHA_INFECTED_COUNT=$((CONTAINER_NEZHA_INFECTED_COUNT + 1))
     NEZHA_INFECTED_LIST="${NEZHA_INFECTED_LIST}
-[NEZHA-INFECTED] ${name} | REASON:${reason}"
+[哪吒小鸡疑似感染] ${name} | 原因:${reason}"
   fi
 
-  echo "[CONTAINER-INFECTED] ${name} | NEZHA:${nezha_flag} | REASON:${reason}"
+  high "小鸡疑似感染：${name} | 哪吒:${nezha_flag} | 原因:${reason}"
 }
 
 container_warn() {
@@ -131,9 +165,9 @@ container_warn() {
 
   CONTAINER_WARN_COUNT=$((CONTAINER_WARN_COUNT + 1))
   WARN_LIST="${WARN_LIST}
-[WARN] ${name} | NEZHA:${nezha_flag} | REASON:${reason}"
+[可疑] ${name} | 哪吒:${nezha_flag} | 原因:${reason}"
 
-  echo "[CONTAINER-WARN] ${name} | NEZHA:${nezha_flag} | REASON:${reason}"
+  warn "小鸡存在可疑项：${name} | 哪吒:${nezha_flag} | 原因:${reason}"
 }
 
 container_skipped() {
@@ -143,7 +177,7 @@ container_skipped() {
 
   CONTAINER_SKIPPED_COUNT=$((CONTAINER_SKIPPED_COUNT + 1))
   SKIPPED_LIST="${SKIPPED_LIST}
-[SKIPPED] ${name} | STATUS:${status} | REASON:${reason}"
+[未扫描] ${name} | 状态:${status} | 原因:${reason}"
 }
 
 has_cmd() {
@@ -161,77 +195,84 @@ run_in_container() {
   fi
 }
 
-section "0. Basic Info"
-echo "Report: $REPORT"
-echo "Host:   $HOST"
-echo "Time:   $(date)"
-echo "Kernel: $(uname -a)"
-echo "User:   $(id)"
-echo "Connection threshold: ${CONN_THRESHOLD}"
-echo "Nezha only mode: ${NEZHA_ONLY}"
+section "0. 基础信息"
+echo "报告文件：$REPORT"
+echo "主机名：$HOST"
+echo "时间：$(date)"
+echo "内核：$(uname -a)"
+echo "当前用户：$(id)"
+echo "公网连接阈值：${CONN_THRESHOLD}"
+echo "是否只扫描哪吒小鸡：${NEZHA_ONLY}"
 echo
 
-echo "Virtualization:"
+echo "虚拟化环境："
 systemd-detect-virt 2>/dev/null || true
 echo
 
-echo "Uptime:"
+echo "系统负载："
 uptime 2>/dev/null || true
 echo
 
 if [ "$(id -u)" != "0" ]; then
-  host_warn "Not running as root. Some checks may be incomplete."
+  host_warn "当前不是 root，检测结果可能不完整"
 else
-  host_ok "Running as root."
+  host_ok "当前是 root，权限完整"
 fi
 
-section "1. Host Top CPU / Memory"
+section "1. 母机 CPU / 内存最高进程"
 echo "----- CPU TOP 30 -----"
 ps -eo pid,ppid,user,stat,pcpu,pmem,etime,comm,args --sort=-pcpu | head -30
 
 echo
-echo "----- MEM TOP 30 -----"
+echo "----- 内存 TOP 30 -----"
 ps -eo pid,ppid,user,stat,pcpu,pmem,etime,comm,args --sort=-pmem | head -30
 
-section "2. Host Infection Indicators"
+section "2. 母机感染特征扫描"
 
 HOST_PROC_STRONG="$(ps auxww | awk '$1=="root"{print}' | grep -Eia "$STRONG_RE|$URL_EXEC_RE" | grep -vE 'grep|nezhajc' || true)"
 if [ -n "$HOST_PROC_STRONG" ]; then
-  echo "----- Host root suspicious processes -----"
+  echo "----- 母机 root 强特征可疑进程 -----"
   echo "$HOST_PROC_STRONG"
-  host_high "Strong suspicious root process found on host."
+  host_high "母机 root 进程中发现强感染特征"
 else
-  host_ok "No strong suspicious root process found on host."
+  host_ok "母机 root 进程未发现强感染特征"
 fi
 
 HOST_PROC_MAPPED="$(ps auxww | awk '$1!="root"{print}' | grep -Eia "$STRONG_RE|$URL_EXEC_RE" | grep -vE 'grep|nezhajc' || true)"
 if [ -n "$HOST_PROC_MAPPED" ]; then
   echo
-  echo "----- Non-root or container-mapped suspicious processes -----"
+  echo "----- 非 root / 容器映射用户可疑进程，仅提示，不判定母机感染 -----"
   echo "$HOST_PROC_MAPPED"
-  host_warn "Suspicious mapped process found. Check container scan result."
+  host_warn "母机进程表中发现容器映射侧可疑进程，需要结合小鸡扫描结果判断"
+else
+  host_ok "母机进程表未发现容器映射侧强特征可疑进程"
 fi
 
-section "3. Host Nezha Related Items"
+section "3. 母机哪吒相关进程与服务，仅提示"
 HOST_NEZHA="$(ps auxww | grep -Eia 'nezha-agent|/opt/nezha|/etc/nezha|nezha' | grep -vE 'grep|nezhajc' || true)"
 if [ -n "$HOST_NEZHA" ]; then
-  echo "----- Host Nezha related processes -----"
+  echo "----- 母机哪吒相关进程 -----"
   echo "$HOST_NEZHA"
+  warn "母机存在哪吒相关进程，仅提示，不直接判定感染"
 else
-  echo "No host Nezha process found."
+  ok "母机未发现哪吒相关进程"
 fi
 
 echo
-echo "----- Host Nezha related files -----"
-find /etc/systemd/system /lib/systemd/system /opt /etc -maxdepth 4 \
-  \( -iname '*nezha*' -o -iname 'config*.yml' \) -ls 2>/dev/null | head -200 || true
+echo "----- 母机哪吒相关服务/文件 -----"
+HOST_NEZHA_FILES="$(find /etc/systemd/system /lib/systemd/system /opt /etc -maxdepth 4 \( -iname '*nezha*' -o -iname 'config*.yml' \) -ls 2>/dev/null | head -200 || true)"
+if [ -n "$HOST_NEZHA_FILES" ]; then
+  echo "$HOST_NEZHA_FILES"
+else
+  ok "母机未发现明显哪吒相关文件"
+fi
 
-section "4. Host ld.so.preload"
+section "4. 母机 /etc/ld.so.preload 检查"
 if [ -e /etc/ld.so.preload ]; then
   PRELOAD_CONTENT="$(cat /etc/ld.so.preload 2>/dev/null || true)"
   ls -lah /etc/ld.so.preload 2>/dev/null
   lsattr /etc/ld.so.preload 2>/dev/null || true
-  echo "----- Content -----"
+  echo "----- 内容 -----"
   echo "$PRELOAD_CONTENT"
 
   echo "$PRELOAD_CONTENT" | grep -Eia 'usranalyse|libusranalyse|xmrig|miner|SystemLog|/tmp|/dev/shm|/var/tmp' >/dev/null
@@ -248,72 +289,74 @@ if [ -e /etc/ld.so.preload ]; then
         | head -100 || true
     done < /etc/ld.so.preload
 
-    host_high "/etc/ld.so.preload exists and matches malicious indicators."
+    host_high "/etc/ld.so.preload 存在且命中恶意特征"
   else
-    host_warn "/etc/ld.so.preload exists. Manual check required."
+    host_warn "/etc/ld.so.preload 存在，但未命中当前恶意特征，需要人工确认"
   fi
 else
-  host_ok "/etc/ld.so.preload does not exist."
+  host_ok "/etc/ld.so.preload 不存在"
 fi
 
-section "5. Host Strong Temp Files"
+section "5. 母机临时目录强特征文件"
 HOST_TMP_STRONG="$(find /tmp /var/tmp /dev/shm -type f -perm -111 2>/dev/null | grep -Eia 'SystemLog|/tmp/b$|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|xmrig|kinsing|kdevtmpfsi|usranalyse' || true)"
 
 if [ -n "$HOST_TMP_STRONG" ]; then
   echo "$HOST_TMP_STRONG"
-  host_high "Strong malicious temp file found on host."
+  host_high "母机临时目录发现强特征恶意文件"
 else
-  host_ok "No strong malicious temp file found on host."
+  host_ok "母机临时目录未发现强特征恶意文件"
 fi
 
 HOST_TMP_ALL="$(find /tmp /var/tmp /dev/shm -type f -perm -111 -ls 2>/dev/null || true)"
 if [ -n "$HOST_TMP_ALL" ]; then
   echo
-  echo "----- All executable files in host temp dirs. Manual check only. -----"
+  echo "----- 母机临时目录所有可执行文件，仅供人工确认，不直接判定感染 -----"
   echo "$HOST_TMP_ALL"
+else
+  ok "母机临时目录未发现可执行文件"
 fi
 
-section "6. Host cron / systemd / startup strong indicators"
+section "6. 母机 cron / systemd / 启动项强特征"
 
 HOST_CRON_STRONG="$(grep -RInE "$STRONG_RE|$URL_EXEC_RE" /etc/cron* /var/spool/cron* 2>/dev/null || true)"
 if [ -n "$HOST_CRON_STRONG" ]; then
-  echo "----- Host cron strong indicators -----"
+  echo "----- cron 强特征 -----"
   echo "$HOST_CRON_STRONG"
-  host_high "Strong suspicious cron item found on host."
+  host_high "母机 cron 中发现强感染特征"
 else
-  host_ok "No strong suspicious cron item found on host."
+  host_ok "母机 cron 未发现强感染特征"
 fi
 
 HOST_SYSD_STRONG="$(grep -RInE "$STRONG_RE|$URL_EXEC_RE" /etc/systemd/system /lib/systemd/system 2>/dev/null || true)"
 if [ -n "$HOST_SYSD_STRONG" ]; then
   echo
-  echo "----- Host systemd strong indicators -----"
+  echo "----- systemd 强特征 -----"
   echo "$HOST_SYSD_STRONG"
-  host_high "Strong suspicious systemd item found on host."
+  host_high "母机 systemd 中发现强感染特征"
 else
-  host_ok "No strong suspicious systemd item found on host."
+  host_ok "母机 systemd 未发现强感染特征"
 fi
 
 HOST_START_STRONG="$(grep -RInE "$STRONG_RE|$URL_EXEC_RE" /etc/rc.local /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null || true)"
 if [ -n "$HOST_START_STRONG" ]; then
   echo
-  echo "----- Host startup strong indicators -----"
+  echo "----- 启动项强特征 -----"
   echo "$HOST_START_STRONG"
-  host_high "Strong suspicious startup item found on host."
+  host_high "母机启动项中发现强感染特征"
 else
-  host_ok "No strong suspicious startup item found on host."
+  host_ok "母机启动项未发现强感染特征"
 fi
 
-section "7. Host Users and SSH"
-echo "----- UID 0 users -----"
+section "7. 母机用户与 SSH 后门检查"
+echo "----- UID 0 用户 -----"
 UID0="$(awk -F: '$3==0 {print}' /etc/passwd)"
 echo "$UID0"
 
 UID0_COUNT="$(echo "$UID0" | grep -c .)"
 if [ "$UID0_COUNT" -gt 1 ]; then
-  host_high "Multiple UID 0 users found."
+  host_high "发现多个 UID 0 用户，严重后门风险"
 else
-  host_ok "UID 0 user count is normal."
+  host_ok "UID 0 用户数量正常"
 fi
 
 echo
@@ -321,12 +364,12 @@ echo "----- root authorized_keys -----"
 if [ -f /root/.ssh/authorized_keys ]; then
   ls -lah /root/.ssh/authorized_keys
   cat /root/.ssh/authorized_keys
-  host_warn "root authorized_keys exists. Manual check required."
+  host_warn "root authorized_keys 存在，请确认公钥是否都是你自己的"
 else
-  host_ok "root authorized_keys does not exist."
+  host_ok "root authorized_keys 不存在"
 fi
 
-section "8. Host Deleted Running Executables"
+section "8. 母机 deleted 运行程序"
 DELETED_FOUND=0
 
 for p in /proc/[0-9]*; do
@@ -343,32 +386,32 @@ for p in /proc/[0-9]*; do
 done
 
 if [ "$DELETED_FOUND" -eq 1 ]; then
-  host_warn "Deleted running executable found. Manual check required."
+  host_warn "发现 deleted 状态运行程序，可能是升级残留，也可能是恶意进程"
 else
-  host_ok "No deleted running executable found."
+  host_ok "未发现 deleted 状态运行程序"
 fi
 
-section "9. Host Network"
-echo "----- Listening ports -----"
+section "9. 母机网络连接"
+echo "----- 监听端口 -----"
 ss -lntup 2>/dev/null || true
 
 echo
-echo "----- Suspicious host connections -----"
+echo "----- 母机可疑连接过滤 -----"
 HOST_NET_SUSP="$(ss -tunp 2>/dev/null | grep -Eia 'xmrig|miner|SystemLog|/tmp|/dev/shm|/var/tmp|stratum|3333|4444|5555|7777|14444|usranalyse|86\.54\.82\.179|152\.42\.182\.35' || true)"
 if [ -n "$HOST_NET_SUSP" ]; then
   echo "$HOST_NET_SUSP"
-  host_warn "Suspicious host network connection found."
+  host_warn "母机发现可疑网络连接或可疑端口"
 else
-  host_ok "No common malicious host network connection found."
+  host_ok "母机未发现常见矿池/木马特征连接"
 fi
 
-section "10. Incus High-Risk Config"
+section "10. Incus 高危配置检查"
 if has_cmd incus; then
-  echo "----- Incus containers -----"
+  echo "----- Incus 容器列表 -----"
   incus list 2>/dev/null || true
 
   echo
-  echo "----- High-risk config filter -----"
+  echo "----- 高危配置过滤 -----"
 
   while IFS=, read -r cname cstatus; do
     [ -z "$cname" ] && continue
@@ -378,44 +421,49 @@ if has_cmd incus; then
 
     CFG="$(incus config show "$cname" --expanded 2>/dev/null || true)"
 
-    echo "$CFG" \
-      | grep -Eia 'security.privileged|security.nesting|raw.lxc|raw.idmap|source: /|docker.sock|unix.socket|/var/lib/incus|/var/snap/lxd|/var/lib/lxd|/root|/etc' || true
+    RISK_CFG="$(echo "$CFG" | grep -Eia 'security.privileged|security.nesting|raw.lxc|raw.idmap|source: /|docker.sock|unix.socket|/var/lib/incus|/var/snap/lxd|/var/lib/lxd|/root|/etc' || true)"
+
+    if [ -n "$RISK_CFG" ]; then
+      echo "$RISK_CFG"
+    else
+      ok "$cname 未发现明显高危配置"
+    fi
 
     echo "$CFG" \
       | grep -Eia 'security.privileged: "true"|raw.lxc|raw.idmap|source: /$|source: /root|source: /etc|docker.sock|unix.socket|/var/lib/incus|/var/snap/lxd|/var/lib/lxd' >/dev/null
 
     if [ $? -eq 0 ]; then
-      escape_risk "Instance $cname has privileged/raw/socket/host-mount config."
+      escape_risk "实例 $cname 存在特权/挂载/socket/raw 配置，容器逃逸风险较高"
     fi
   done < <(incus list -c ns --format csv 2>/dev/null)
 
 else
-  host_warn "incus command not found. Skip Incus config check."
+  host_warn "未找到 incus 命令，跳过 Incus 配置检查"
 fi
 
 if [ "$SCAN_CONTAINER" -eq 1 ]; then
-  section "11. Container Scan. Nezha containers are prioritized."
+  section "11. 扫描所有运行中的小鸡，重点检查安装哪吒的小鸡"
 
   if ! has_cmd incus; then
-    echo "incus command not found. Skip container scan."
+    echo "未找到 incus，跳过小鸡扫描。"
   else
     while IFS=, read -r cname cstatus; do
       [ -z "$cname" ] && continue
 
       if [ "$cstatus" != "RUNNING" ]; then
-        container_skipped "$cname" "$cstatus" "not running"
+        container_skipped "$cname" "$cstatus" "容器未运行"
         continue
       fi
 
       C_HIGH=0
       C_WARN=0
       C_REASON=""
-      C_NEZHA="NO"
+      C_NEZHA="否"
 
       echo
-      echo "================ Container: $cname [$cstatus] ================"
+      echo "================ 小鸡: $cname [$cstatus] ================"
 
-      echo "----- Nezha installation check -----"
+      echo "----- 哪吒安装检测 -----"
       C_NEZHA_INFO="$(run_in_container "$cname" '
         {
           echo "[process]"
@@ -446,22 +494,22 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
       echo "$C_NEZHA_INFO" | grep -Eia 'nezha-agent|/opt/nezha|/etc/nezha|nezha' >/dev/null
       if [ $? -eq 0 ]; then
-        C_NEZHA="YES"
+        C_NEZHA="是"
         CONTAINER_NEZHA_COUNT=$((CONTAINER_NEZHA_COUNT + 1))
         NEZHA_LIST="${NEZHA_LIST}
-[NEZHA] ${cname}"
-        echo "[NEZHA-FOUND] $cname"
+[哪吒小鸡] ${cname}"
+        warn "$cname 安装/运行了哪吒相关组件，将重点扫描"
       else
-        echo "[NEZHA-NOT-FOUND] $cname"
+        ok "$cname 未发现哪吒组件"
       fi
 
-      if [ "$NEZHA_ONLY" -eq 1 ] && [ "$C_NEZHA" != "YES" ]; then
-        container_skipped "$cname" "$cstatus" "no nezha, skipped by --nezha-only"
+      if [ "$NEZHA_ONLY" -eq 1 ] && [ "$C_NEZHA" != "是" ]; then
+        container_skipped "$cname" "$cstatus" "未安装哪吒，--nezha-only 跳过"
         continue
       fi
 
       echo
-      echo "----- Nezha directory suspicious file check -----"
+      echo "----- 哪吒目录异常文件检查 -----"
       C_NEZHA_BAD="$(run_in_container "$cname" '
         {
           find /opt/nezha /etc/nezha -type f -perm -111 -ls 2>/dev/null
@@ -474,26 +522,26 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       if [ -n "$C_NEZHA_BAD" ]; then
         echo "$C_NEZHA_BAD"
         C_HIGH=1
-        C_REASON="${C_REASON} nezha_dir_suspicious"
+        C_REASON="${C_REASON} 哪吒目录异常"
       else
-        echo "Not found."
+        ok "$cname 哪吒目录未发现异常文件"
       fi
 
       echo
-      echo "----- Process strong indicator check -----"
+      echo "----- 当前进程强特征扫描 -----"
       C_PS="$(run_in_container "$cname" \
         'ps auxww 2>/dev/null | grep -Eia "xmrig|miner|kinsing|kdevtmpfsi|SystemLog|/tmp/b|/tmp/SystemLog|/tmp/download.sh|download.sh|ice.sh|harvest.sh|xmrig.sh|stratum|masscan|zmap|pnscan|/dev/shm|/var/tmp|usranalyse|ld.so.preload|recvp.php|curl .*sh|wget .*sh|curl.*\|.*sh|wget.*\|.*sh|86\.54\.82\.179|152\.42\.182\.35|mkdir -p /root/.ssh|chmod 700 /root/.ssh|\{\}" | grep -v grep' || true)"
 
       if [ -n "$C_PS" ]; then
         echo "$C_PS"
         C_HIGH=1
-        C_REASON="${C_REASON} suspicious_process"
+        C_REASON="${C_REASON} 可疑进程"
       else
-        echo "Not found."
+        ok "$cname 当前进程未发现强特征"
       fi
 
       echo
-      echo "----- Public remote IP / connection count. Threshold: ${CONN_THRESHOLD} -----"
+      echo "----- 小鸡公网远端 IP / 连接数量检查，阈值 ${CONN_THRESHOLD} -----"
       C_CONN="$(run_in_container "$cname" '
         TMPF="/tmp/.nezhajc_conn_ips.$$"
         : > "$TMPF"
@@ -534,7 +582,8 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
       if echo "$C_CONN" | grep -q "NO_NET_TOOL=1"; then
         C_WARN=1
-        C_REASON="${C_REASON} network_tool_missing"
+        C_REASON="${C_REASON} 缺少网络检测工具"
+        warn "$cname 缺少 ss/netstat，无法统计连接数量"
       else
         TOTAL_PUBLIC_CONN="$(echo "$C_CONN" | awk -F= '/TOTAL_PUBLIC_CONN=/{print $2}' | tail -1)"
         UNIQUE_PUBLIC_IP="$(echo "$C_CONN" | awk -F= '/UNIQUE_PUBLIC_IP=/{print $2}' | tail -1)"
@@ -544,10 +593,14 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
         if [ "$UNIQUE_PUBLIC_IP" -ge "$CONN_THRESHOLD" ] 2>/dev/null; then
           C_HIGH=1
-          C_REASON="${C_REASON} massive_unique_ip_${UNIQUE_PUBLIC_IP}"
+          C_REASON="${C_REASON} 公网远端IP过多_${UNIQUE_PUBLIC_IP}"
+          high "$cname 公网远端 IP 数 ${UNIQUE_PUBLIC_IP} >= ${CONN_THRESHOLD}"
         elif [ "$TOTAL_PUBLIC_CONN" -ge "$CONN_THRESHOLD" ] 2>/dev/null; then
           C_HIGH=1
-          C_REASON="${C_REASON} massive_public_conn_${TOTAL_PUBLIC_CONN}"
+          C_REASON="${C_REASON} 公网连接过多_${TOTAL_PUBLIC_CONN}"
+          high "$cname 公网连接数 ${TOTAL_PUBLIC_CONN} >= ${CONN_THRESHOLD}"
+        else
+          ok "$cname 公网远端 IP / 连接数量未超过阈值"
         fi
       fi
 
@@ -561,17 +614,17 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
         echo "$C_PRELOAD" | grep -Eia 'usranalyse|libusranalyse|xmrig|miner|SystemLog|/tmp|/dev/shm|/var/tmp' >/dev/null
         if [ $? -eq 0 ]; then
           C_HIGH=1
-          C_REASON="${C_REASON} ld.so.preload"
+          C_REASON="${C_REASON} ld.so.preload异常"
         else
           C_WARN=1
-          C_REASON="${C_REASON} preload_exists"
+          C_REASON="${C_REASON} preload存在"
         fi
       else
-        echo "Not found."
+        ok "$cname /etc/ld.so.preload 不存在"
       fi
 
       echo
-      echo "----- Executable files in temp dirs -----"
+      echo "----- 临时目录可执行文件 -----"
       C_TMP="$(run_in_container "$cname" \
         'find /tmp /var/tmp /dev/shm -type f -perm -111 -ls 2>/dev/null | head -200' || true)"
 
@@ -581,17 +634,17 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
         echo "$C_TMP" | grep -Eia 'SystemLog|/tmp/b|download.sh|ice.sh|harvest.sh|xmrig.sh|xmrig|miner|kinsing|kdevtmpfsi|usranalyse|stratum' >/dev/null
         if [ $? -eq 0 ]; then
           C_HIGH=1
-          C_REASON="${C_REASON} tmp_strong_exec"
+          C_REASON="${C_REASON} 临时目录恶意文件"
         else
           C_WARN=1
-          C_REASON="${C_REASON} tmp_exec"
+          C_REASON="${C_REASON} 临时目录可执行文件"
         fi
       else
-        echo "Not found."
+        ok "$cname 临时目录未发现可执行文件"
       fi
 
       echo
-      echo "----- cron suspicious items -----"
+      echo "----- cron 可疑项 -----"
       C_CRON="$(run_in_container "$cname" \
         '{
           crontab -l 2>/dev/null
@@ -601,26 +654,26 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       if [ -n "$C_CRON" ]; then
         echo "$C_CRON"
         C_HIGH=1
-        C_REASON="${C_REASON} suspicious_cron"
+        C_REASON="${C_REASON} cron可疑"
       else
-        echo "Not found."
+        ok "$cname cron 未发现可疑项"
       fi
 
       echo
-      echo "----- startup suspicious items -----"
+      echo "----- 启动项可疑项 systemd/openrc/profile -----"
       C_STARTUP="$(run_in_container "$cname" \
         'grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|ld.so.preload|usranalyse|download.sh|ice.sh|harvest.sh|xmrig.sh|recvp.php|/root/.ssh|86\.54\.82\.179|152\.42\.182\.35" /etc/systemd/system /lib/systemd/system /etc/init.d /etc/runlevels /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null | head -200' || true)"
 
       if [ -n "$C_STARTUP" ]; then
         echo "$C_STARTUP"
         C_HIGH=1
-        C_REASON="${C_REASON} suspicious_startup"
+        C_REASON="${C_REASON} 启动项可疑"
       else
-        echo "Not found."
+        ok "$cname 启动项未发现可疑项"
       fi
 
       echo
-      echo "----- SSH authorized_keys. Warning only. -----"
+      echo "----- SSH authorized_keys 检查，仅提示 -----"
       C_SSH="$(run_in_container "$cname" \
         '{
           if [ -f /root/.ssh/authorized_keys ]; then
@@ -634,22 +687,22 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       if [ -n "$C_SSH" ]; then
         echo "$C_SSH"
         C_WARN=1
-        C_REASON="${C_REASON} ssh_key_check"
+        C_REASON="${C_REASON} SSH公钥需确认"
       else
-        echo "Not found."
+        ok "$cname 未发现 authorized_keys"
       fi
 
       echo
-      echo "----- shell history suspicious items. Warning only. -----"
+      echo "----- 历史命令可疑项，仅提示 -----"
       C_HISTORY="$(run_in_container "$cname" \
         'grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|download.sh|ice.sh|harvest.sh|xmrig.sh|recvp.php|86\.54\.82\.179|152\.42\.182\.35" /root/.bash_history /home/*/.bash_history 2>/dev/null | head -120' || true)"
 
       if [ -n "$C_HISTORY" ]; then
         echo "$C_HISTORY"
         C_WARN=1
-        C_REASON="${C_REASON} suspicious_history"
+        C_REASON="${C_REASON} 历史命令可疑"
       else
-        echo "Not found."
+        ok "$cname 历史命令未发现可疑项"
       fi
 
       if [ "$C_HIGH" -eq 1 ]; then
@@ -657,82 +710,82 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       elif [ "$C_WARN" -eq 1 ]; then
         container_warn "$cname" "$C_REASON" "$C_NEZHA"
       else
-        echo "[CONTAINER-OK] $cname | NEZHA:${C_NEZHA} | No obvious infection signs."
+        ok "$cname | 哪吒:${C_NEZHA} | 未发现明显感染痕迹"
       fi
 
     done < <(incus list -c ns --format csv 2>/dev/null)
   fi
 else
-  section "11. Container Scan"
-  echo "--host-only used. Skip container scan."
+  section "11. 小鸡扫描"
+  echo "已使用 --host-only，跳过小鸡扫描。"
 fi
 
-section "12. Final Result"
-echo "Report: $REPORT"
+section "12. 最终结论"
+echo "报告文件：$REPORT"
 echo
 
 if [ "$HOST_HIGH" -eq 1 ]; then
-  echo "Host infection status: HIGH / SUSPICIOUS"
+  echo -e "${RED}母机感染状态：疑似感染 / 高危${NC}"
 elif [ "$HOST_WARN" -eq 1 ]; then
-  echo "Host infection status: WARNING / MANUAL CHECK REQUIRED"
+  echo -e "${YELLOW}母机感染状态：未发现明确感染，但存在可疑项，需要人工确认${NC}"
 else
-  echo "Host infection status: NO OBVIOUS SIGNS"
+  echo -e "${GREEN}母机感染状态：未发现明显感染痕迹${NC}"
 fi
 
 if [ "$ESCAPE_RISK" -eq 1 ]; then
-  echo "Container escape risk config: FOUND"
+  echo -e "${RED}容器逃逸风险配置：发现高危配置，需要检查对应实例${NC}"
 else
-  echo "Container escape risk config: NOT FOUND"
+  echo -e "${GREEN}容器逃逸风险配置：未发现明显高危配置${NC}"
 fi
 
 echo
-echo "Nezha containers count: $CONTAINER_NEZHA_COUNT"
+echo "安装/运行哪吒的小鸡数量：$CONTAINER_NEZHA_COUNT"
 if [ "$CONTAINER_NEZHA_COUNT" -gt 0 ]; then
   echo "$NEZHA_LIST"
 else
-  echo "No Nezha container found."
+  echo -e "${GREEN}未发现安装/运行哪吒的小鸡${NC}"
 fi
 
 echo
-echo "Infected Nezha containers count: $CONTAINER_NEZHA_INFECTED_COUNT"
+echo "哪吒小鸡疑似感染数量：$CONTAINER_NEZHA_INFECTED_COUNT"
 if [ "$CONTAINER_NEZHA_INFECTED_COUNT" -gt 0 ]; then
-  echo "$NEZHA_INFECTED_LIST"
+  echo -e "${RED}${NEZHA_INFECTED_LIST}${NC}"
 else
-  echo "No infected Nezha container found."
+  echo -e "${GREEN}未发现哪吒小鸡疑似感染${NC}"
 fi
 
 echo
-echo "All infected containers count: $CONTAINER_INFECTED_COUNT"
+echo "全部疑似感染小鸡数量：$CONTAINER_INFECTED_COUNT"
 if [ "$CONTAINER_INFECTED_COUNT" -gt 0 ]; then
-  echo "$INFECTED_LIST"
+  echo -e "${RED}${INFECTED_LIST}${NC}"
 else
-  echo "No infected container found."
+  echo -e "${GREEN}未发现疑似感染小鸡${NC}"
 fi
 
 echo
-echo "Warning containers count: $CONTAINER_WARN_COUNT"
+echo "可疑小鸡数量：$CONTAINER_WARN_COUNT"
 if [ "$CONTAINER_WARN_COUNT" -gt 0 ]; then
-  echo "$WARN_LIST"
+  echo -e "${YELLOW}${WARN_LIST}${NC}"
 else
-  echo "No warning-only container found."
+  echo -e "${GREEN}未发现仅 WARN 的小鸡${NC}"
 fi
 
 echo
-echo "Skipped containers count: $CONTAINER_SKIPPED_COUNT"
+echo "未扫描小鸡数量：$CONTAINER_SKIPPED_COUNT"
 if [ "$CONTAINER_SKIPPED_COUNT" -gt 0 ]; then
   echo "$SKIPPED_LIST"
 fi
 
 echo
-echo "Rules:"
-echo "1. Host is not marked infected just because UID 1000000 container-mapped process is suspicious."
-echo "2. Host is marked HIGH only when root process, malicious ld.so.preload, strong temp file, cron, or systemd indicator is found."
-echo "3. Containers with Nezha are listed as [NEZHA] and checked more carefully."
-echo "4. Container is marked INFECTED if public remote IP count or public connection count >= ${CONN_THRESHOLD}."
-echo "5. Container is marked INFECTED if /tmp/SystemLog, /tmp/b, download.sh, ice.sh, harvest.sh, xmrig.sh, ld.so.preload, suspicious cron, or download-exec command is found."
-echo "6. authorized_keys and shell history are warning-only."
-echo "7. Use --nezha-only to scan only containers with Nezha."
-echo "8. No script can prove a system is 100 percent clean."
+echo "判定规则："
+echo "1. 母机不会因为容器映射用户 1000000 出现可疑进程就直接判定感染。"
+echo "2. 母机只有命中 root 强特征进程、恶意 ld.so.preload、母机临时目录强特征文件、母机 cron/systemd 强特征时才判定高危。"
+echo "3. 小鸡安装/运行哪吒会显示为 [哪吒小鸡]，并重点扫描哪吒目录、哪吒服务、哪吒进程、哪吒配置。"
+echo "4. 小鸡公网远端 IP 数或公网连接数 >= ${CONN_THRESHOLD} 时，直接标记为疑似感染。"
+echo "5. 小鸡出现 /tmp/SystemLog、/tmp/b、download.sh、ice.sh、harvest.sh、xmrig.sh、ld.so.preload、可疑 cron、下载执行命令，直接标记为疑似感染。"
+echo "6. authorized_keys 和历史命令默认只标记 WARN，需要人工确认。"
+echo "7. 使用 --nezha-only 可以只扫描安装/运行哪吒的小鸡。"
+echo "8. 没有脚本能 100% 证明系统绝对干净。"
 
 if [ "$HOST_HIGH" -eq 1 ] || [ "$ESCAPE_RISK" -eq 1 ] || [ "$CONTAINER_INFECTED_COUNT" -gt 0 ]; then
   exit 2
