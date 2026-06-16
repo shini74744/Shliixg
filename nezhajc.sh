@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# muji_infection_check.sh
+# nezhajc.sh
 # 母机 + Incus/LXC 小鸡感染痕迹检测脚本
 # 只读检测：不删除、不杀进程、不修改配置
 #
 # 用法：
-#   bash muji_infection_check.sh
-#   bash muji_infection_check.sh --no-container
-#   bash muji_infection_check.sh --no-color
+#   bash nezhajc.sh
+#   bash nezhajc.sh --host-only
+#   bash nezhajc.sh --no-color
 #
 # 退出码：
 #   0 = 未发现明显感染痕迹
-#   1 = 存在可疑项 WARN
-#   2 = 存在高危项 HIGH / 疑似感染
+#   1 = 存在 WARN 可疑项
+#   2 = 存在 HIGH 感染/高危项
 
 set +e
 export LC_ALL=C
@@ -21,7 +21,7 @@ USE_COLOR=1
 
 for arg in "$@"; do
   case "$arg" in
-    --no-container|--host-only)
+    --host-only|--no-container)
       SCAN_CONTAINER=0
       ;;
     --no-color)
@@ -30,15 +30,15 @@ for arg in "$@"; do
     -h|--help)
       cat <<'HELP'
 Usage:
-  bash muji_infection_check.sh
-  bash muji_infection_check.sh --no-container
-  bash muji_infection_check.sh --no-color
+  bash nezhajc.sh
+  bash nezhajc.sh --host-only
+  bash nezhajc.sh --no-color
 
 Description:
-  Read-only infection check for Incus/LXC host and containers.
+  Read-only security check for Incus/LXC host and containers.
 
 Exit code:
-  0 = clean / no obvious signs
+  0 = no obvious signs
   1 = warning signs found
   2 = high-risk infection signs found
 HELP
@@ -49,7 +49,7 @@ done
 
 HOST="$(hostname 2>/dev/null || echo unknown)"
 TIME="$(date +%F-%H%M%S)"
-REPORT="/root/muji_infection_check_${HOST}_${TIME}.log"
+REPORT="/root/nezhajc_${HOST}_${TIME}.log"
 
 exec > >(tee -a "$REPORT") 2>&1
 
@@ -67,7 +67,7 @@ else
   NC=""
 fi
 
-HOST_INFECTED=0
+HOST_HIGH=0
 HOST_WARN=0
 ESCAPE_RISK=0
 
@@ -79,8 +79,14 @@ INFECTED_LIST=""
 WARN_LIST=""
 SKIPPED_LIST=""
 
-STRONG_RE='xmrig|kinsing|kdevtmpfsi|SystemLog|/tmp/b|/tmp/SystemLog|stratum|masscan|zmap|pnscan|libusranalyse|usranalyse|ld\.so\.preload'
-SUSP_RE='xmrig|miner|kinsing|kdevtmpfsi|SystemLog|/tmp/b|/tmp/SystemLog|stratum|masscan|zmap|pnscan|/dev/shm|/var/tmp|ld\.so\.preload|usranalyse|libusranalyse|base64 -d|curl .*\|.*sh|wget .*\|.*sh|bash -c'
+# 强感染特征：命中后一般直接判 INFECTED/HIGH
+STRONG_RE='xmrig|kinsing|kdevtmpfsi|SystemLog|/tmp/SystemLog|/tmp/b([[:space:]]|$)|/tmp/download\.sh|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|stratum|masscan|zmap|pnscan|libusranalyse|usranalyse|ld\.so\.preload|recvp\.php|/root/\.ssh|authorized_keys|mkdir -p /root/\.ssh|chmod 700 /root/\.ssh'
+
+# 普通可疑特征：命中后 WARN，若结合上下文可转 HIGH
+SUSP_RE='xmrig|miner|kinsing|kdevtmpfsi|SystemLog|/tmp/SystemLog|/tmp/b([[:space:]]|$)|/tmp/download\.sh|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|stratum|masscan|zmap|pnscan|/dev/shm|/var/tmp|ld\.so\.preload|usranalyse|libusranalyse|recvp\.php|base64 -d|curl .*sh|wget .*sh|curl.*\|.*sh|wget.*\|.*sh|bash -c|sh -c|chmod \+x|chattr|authorized_keys|/root/\.ssh|mkdir -p /root/\.ssh|^[[:space:]]*[0-9]+[[:space:]]+.*\{\}'
+
+# URL/IP 下载执行特征
+URL_EXEC_RE='http://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|https://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|curl -fsSL|curl -sL|curl -s |wget -O-|wget -qO-|wget .* -O /tmp|curl .* -o /tmp'
 
 section() {
   echo
@@ -88,7 +94,7 @@ section() {
 }
 
 host_high() {
-  HOST_INFECTED=1
+  HOST_HIGH=1
   echo -e "${RED}[HOST-HIGH] $*${NC}"
 }
 
@@ -139,10 +145,26 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-safe_incusexec() {
-  local container="$1"
+run_in_container() {
+  local cname="$1"
   local cmd="$2"
-  incus exec "$container" -- sh -c "$cmd" 2>/dev/null
+
+  if has_cmd timeout; then
+    timeout 25 incus exec "$cname" -- sh -c "$cmd" 2>/dev/null
+  else
+    incus exec "$cname" -- sh -c "$cmd" 2>/dev/null
+  fi
+}
+
+print_suspicious_block() {
+  local title="$1"
+  local content="$2"
+
+  if [ -n "$content" ]; then
+    echo
+    echo -e "${YELLOW}----- ${title} -----${NC}"
+    echo "$content"
+  fi
 }
 
 section "0. 基础信息"
@@ -152,11 +174,14 @@ echo "时间:     $(date)"
 echo "内核:     $(uname -a)"
 echo "用户:     $(id)"
 echo
+
 echo "虚拟化环境:"
 systemd-detect-virt 2>/dev/null || true
 echo
+
 echo "负载:"
 uptime 2>/dev/null || true
+echo
 
 if [ "$(id -u)" != "0" ]; then
   host_warn "当前不是 root，检测结果可能不完整"
@@ -167,17 +192,18 @@ fi
 section "1. 母机 CPU / 内存最高进程"
 echo "----- CPU TOP 30 -----"
 ps -eo pid,ppid,user,stat,pcpu,pmem,etime,comm,args --sort=-pcpu | head -30
+
 echo
 echo "----- MEM TOP 30 -----"
 ps -eo pid,ppid,user,stat,pcpu,pmem,etime,comm,args --sort=-pmem | head -30
 
 section "2. 母机可疑进程扫描"
-HOST_PS="$(ps auxww | grep -Eia "$SUSP_RE" | grep -vE 'grep|muji_infection_check' || true)"
+HOST_PS="$(ps auxww | grep -Eia "$SUSP_RE|$URL_EXEC_RE" | grep -vE 'grep|nezhajc|muji_infection_check' || true)"
 
 if [ -n "$HOST_PS" ]; then
   echo "$HOST_PS"
 
-  echo "$HOST_PS" | awk '$1=="root"{print}' | grep -Eia "$STRONG_RE" >/dev/null
+  echo "$HOST_PS" | awk '$1=="root"{print}' | grep -Eia "$STRONG_RE|$URL_EXEC_RE" >/dev/null
   if [ $? -eq 0 ]; then
     host_high "母机 root 身份存在强特征可疑进程"
   else
@@ -206,7 +232,7 @@ if [ -e /etc/ld.so.preload ]; then
 
     strings -a "$sofile" 2>/dev/null \
       | grep -Eia 'hide|proc|kill|ssh|curl|wget|miner|stratum|socket|connect|passwd|shadow|authorized|preload|readdir|open|exec|usranalyse' \
-      | head -80 || true
+      | head -100 || true
   done < /etc/ld.so.preload
 
   host_high "/etc/ld.so.preload 存在，这是 Rootkit/动态库劫持常见位置"
@@ -260,7 +286,7 @@ ss -lntup 2>/dev/null || true
 
 echo
 echo "----- 可疑连接过滤 -----"
-NET_SUSP="$(ss -tunp 2>/dev/null | grep -Eia 'xmrig|miner|SystemLog|/tmp|/dev/shm|/var/tmp|stratum|3333|4444|5555|7777|14444|usranalyse' || true)"
+NET_SUSP="$(ss -tunp 2>/dev/null | grep -Eia 'xmrig|miner|SystemLog|/tmp|/dev/shm|/var/tmp|stratum|3333|4444|5555|7777|14444|usranalyse|86\.54\.82\.179|152\.42\.182\.35' || true)"
 
 if [ -n "$NET_SUSP" ]; then
   echo "$NET_SUSP"
@@ -276,12 +302,12 @@ echo "$ROOT_CRON"
 
 echo
 echo "----- 可疑 cron grep -----"
-CRON_SUSP="$(grep -RInE "$SUSP_RE" /etc/cron* /var/spool/cron* 2>/dev/null || true)"
+CRON_SUSP="$(grep -RInE "$SUSP_RE|$URL_EXEC_RE" /etc/cron* /var/spool/cron* 2>/dev/null || true)"
 
 if [ -n "$CRON_SUSP" ]; then
   echo "$CRON_SUSP"
 
-  echo "$CRON_SUSP" | grep -Eia "$STRONG_RE" >/dev/null
+  echo "$CRON_SUSP" | grep -Eia "$STRONG_RE|$URL_EXEC_RE" >/dev/null
   if [ $? -eq 0 ]; then
     host_high "cron 中存在强特征可疑项"
   else
@@ -297,12 +323,12 @@ find /etc/systemd/system /lib/systemd/system -type f -mtime -10 -ls 2>/dev/null 
 
 echo
 echo "----- 可疑 systemd grep -----"
-SYSD_SUSP="$(grep -RInE "$SUSP_RE" /etc/systemd/system /lib/systemd/system 2>/dev/null || true)"
+SYSD_SUSP="$(grep -RInE "$SUSP_RE|$URL_EXEC_RE" /etc/systemd/system /lib/systemd/system 2>/dev/null || true)"
 
 if [ -n "$SYSD_SUSP" ]; then
   echo "$SYSD_SUSP"
 
-  echo "$SYSD_SUSP" | grep -Eia "$STRONG_RE" >/dev/null
+  echo "$SYSD_SUSP" | grep -Eia "$STRONG_RE|$URL_EXEC_RE" >/dev/null
   if [ $? -eq 0 ]; then
     host_high "systemd 中存在强特征可疑项"
   else
@@ -313,7 +339,7 @@ else
 fi
 
 section "9. 母机 profile / shell 启动项检查"
-STARTUP_SUSP="$(grep -RInE "$SUSP_RE" \
+STARTUP_SUSP="$(grep -RInE "$SUSP_RE|$URL_EXEC_RE" \
   /etc/rc.local \
   /etc/profile \
   /etc/profile.d \
@@ -325,7 +351,7 @@ STARTUP_SUSP="$(grep -RInE "$SUSP_RE" \
 if [ -n "$STARTUP_SUSP" ]; then
   echo "$STARTUP_SUSP"
 
-  echo "$STARTUP_SUSP" | grep -Eia "$STRONG_RE" >/dev/null
+  echo "$STARTUP_SUSP" | grep -Eia "$STRONG_RE|$URL_EXEC_RE" >/dev/null
   if [ $? -eq 0 ]; then
     host_high "profile/shell 启动项中存在强特征可疑项"
   else
@@ -425,8 +451,8 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       echo "================ 小鸡: $cname [$cstatus] ================"
 
       echo "----- 进程强特征扫描 -----"
-      C_PS="$(safe_incusexec "$cname" \
-        'ps -efww 2>/dev/null | grep -Eia "xmrig|miner|kinsing|kdevtmpfsi|SystemLog|/tmp/b|/tmp/SystemLog|stratum|masscan|zmap|pnscan|/dev/shm|/var/tmp|usranalyse|ld.so.preload" | grep -v grep' || true)"
+      C_PS="$(run_in_container "$cname" \
+        'ps -efww 2>/dev/null | grep -Eia "xmrig|miner|kinsing|kdevtmpfsi|SystemLog|/tmp/b|/tmp/SystemLog|/tmp/download.sh|download.sh|ice.sh|harvest.sh|xmrig.sh|stratum|masscan|zmap|pnscan|/dev/shm|/var/tmp|usranalyse|ld.so.preload|recvp.php|authorized_keys|/root/.ssh|curl .*sh|wget .*sh|curl.*\|.*sh|wget.*\|.*sh|86\.54\.82\.179|152\.42\.182\.35|mkdir -p /root/.ssh|chmod 700 /root/.ssh|\{\}" | grep -v grep' || true)"
 
       if [ -n "$C_PS" ]; then
         echo "$C_PS"
@@ -437,8 +463,21 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       fi
 
       echo
+      echo "----- 可疑下载执行命令扫描 -----"
+      C_URL_EXEC="$(run_in_container "$cname" \
+        'ps -efww 2>/dev/null | grep -Eia "http://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|https://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|curl -fsSL|curl -sL|wget -O-|wget -qO-|curl .* -o /tmp|wget .* -O /tmp|ice.sh|harvest.sh|xmrig.sh|recvp.php" | grep -v grep' || true)"
+
+      if [ -n "$C_URL_EXEC" ]; then
+        echo "$C_URL_EXEC"
+        C_HIGH=1
+        C_REASON="${C_REASON} download_exec"
+      else
+        echo "未发现"
+      fi
+
+      echo
       echo "----- /etc/ld.so.preload -----"
-      C_PRELOAD="$(safe_incusexec "$cname" \
+      C_PRELOAD="$(run_in_container "$cname" \
         'if [ -s /etc/ld.so.preload ]; then ls -lah /etc/ld.so.preload; cat /etc/ld.so.preload; fi' || true)"
 
       if [ -n "$C_PRELOAD" ]; then
@@ -451,13 +490,13 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
       echo
       echo "----- 临时目录可执行文件 -----"
-      C_TMP="$(safe_incusexec "$cname" \
-        'find /tmp /var/tmp /dev/shm -type f -perm -111 -ls 2>/dev/null | head -100' || true)"
+      C_TMP="$(run_in_container "$cname" \
+        'find /tmp /var/tmp /dev/shm -type f -perm -111 -ls 2>/dev/null | head -200' || true)"
 
       if [ -n "$C_TMP" ]; then
         echo "$C_TMP"
 
-        echo "$C_TMP" | grep -Eia 'SystemLog|/tmp/b|xmrig|miner|kinsing|kdevtmpfsi|usranalyse|stratum' >/dev/null
+        echo "$C_TMP" | grep -Eia 'SystemLog|/tmp/b|download.sh|ice.sh|harvest.sh|xmrig.sh|xmrig|miner|kinsing|kdevtmpfsi|usranalyse|stratum' >/dev/null
         if [ $? -eq 0 ]; then
           C_HIGH=1
           C_REASON="${C_REASON} tmp_strong_exec"
@@ -471,11 +510,11 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
       echo
       echo "----- cron 可疑项 -----"
-      C_CRON="$(safe_incusexec "$cname" \
+      C_CRON="$(run_in_container "$cname" \
         '{
           crontab -l 2>/dev/null
-          grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|ld.so.preload|usranalyse" /etc/cron* /etc/crontabs /etc/periodic /var/spool/cron* 2>/dev/null
-        } | head -120' || true)"
+          grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|ld.so.preload|usranalyse|download.sh|ice.sh|harvest.sh|xmrig.sh|recvp.php|authorized_keys|/root/.ssh|86\.54\.82\.179|152\.42\.182\.35" /etc/cron* /etc/crontabs /etc/periodic /var/spool/cron* 2>/dev/null
+        } | head -200' || true)"
 
       if [ -n "$C_CRON" ]; then
         echo "$C_CRON"
@@ -487,13 +526,46 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
 
       echo
       echo "----- 启动项可疑项 systemd/openrc/profile -----"
-      C_STARTUP="$(safe_incusexec "$cname" \
-        'grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|ld.so.preload|usranalyse" /etc/systemd/system /lib/systemd/system /etc/init.d /etc/runlevels /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null | head -120' || true)"
+      C_STARTUP="$(run_in_container "$cname" \
+        'grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|ld.so.preload|usranalyse|download.sh|ice.sh|harvest.sh|xmrig.sh|recvp.php|authorized_keys|/root/.ssh|86\.54\.82\.179|152\.42\.182\.35" /etc/systemd/system /lib/systemd/system /etc/init.d /etc/runlevels /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null | head -200' || true)"
 
       if [ -n "$C_STARTUP" ]; then
         echo "$C_STARTUP"
         C_HIGH=1
         C_REASON="${C_REASON} suspicious_startup"
+      else
+        echo "未发现"
+      fi
+
+      echo
+      echo "----- SSH 后门与 authorized_keys 检查 -----"
+      C_SSH="$(run_in_container "$cname" \
+        '{
+          if [ -f /root/.ssh/authorized_keys ]; then
+            echo "[root authorized_keys]"
+            ls -lah /root/.ssh/authorized_keys
+            cat /root/.ssh/authorized_keys
+          fi
+          find /root/.ssh /home -name authorized_keys -type f -ls 2>/dev/null
+        } | head -200' || true)"
+
+      if [ -n "$C_SSH" ]; then
+        echo "$C_SSH"
+        C_WARN=1
+        C_REASON="${C_REASON} ssh_key_check"
+      else
+        echo "未发现 authorized_keys"
+      fi
+
+      echo
+      echo "----- 可疑历史命令检查 -----"
+      C_HISTORY="$(run_in_container "$cname" \
+        'grep -RInE "curl|wget|base64|/tmp|/dev/shm|SystemLog|xmrig|miner|stratum|download.sh|ice.sh|harvest.sh|xmrig.sh|recvp.php|authorized_keys|86\.54\.82\.179|152\.42\.182\.35" /root/.bash_history /home/*/.bash_history 2>/dev/null | head -120' || true)"
+
+      if [ -n "$C_HISTORY" ]; then
+        echo "$C_HISTORY"
+        C_WARN=1
+        C_REASON="${C_REASON} suspicious_history"
       else
         echo "未发现"
       fi
@@ -510,14 +582,14 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
   fi
 else
   section "13. 小鸡扫描"
-  echo "已使用 --no-container，跳过小鸡扫描。"
+  echo "已使用 --host-only，跳过小鸡扫描。"
 fi
 
 section "14. 最终结论"
 echo "报告文件: $REPORT"
 echo
 
-if [ "$HOST_INFECTED" -eq 1 ]; then
+if [ "$HOST_HIGH" -eq 1 ]; then
   echo -e "${RED}母机感染痕迹：疑似感染 / 高危${NC}"
 elif [ "$HOST_WARN" -eq 1 ]; then
   echo -e "${YELLOW}母机感染痕迹：未发现明确感染，但存在可疑项，需要人工确认${NC}"
@@ -555,13 +627,13 @@ fi
 
 echo
 echo "说明："
-echo "1. [INFECTED] 表示发现强特征：如 /tmp/SystemLog、/tmp/b、ld.so.preload、可疑 cron、挖矿关键词等。"
-echo "2. [WARN] 表示存在可疑但不一定恶意的现象，如临时目录可执行文件、root authorized_keys。"
-echo "3. 没有脚本能 100% 证明系统绝对干净。"
-echo "4. 若母机出现 ld.so.preload、陌生 UID 0、root 可疑进程，建议重装母机。"
+echo "1. [INFECTED] 表示发现强特征：如 /tmp/SystemLog、/tmp/b、download.sh、ice.sh、harvest.sh、xmrig.sh、ld.so.preload、可疑 cron、挖矿关键词、下载执行命令等。"
+echo "2. [WARN] 表示存在可疑但不一定恶意的现象，如临时目录可执行文件、authorized_keys、历史命令可疑。"
+echo "3. 如果小鸡出现 wget/curl 下载远程 sh 并 pipe 到 sh，基本可按已感染处理。"
+echo "4. 如果母机出现 ld.so.preload、陌生 UID 0、root 可疑进程，建议重装母机。"
 echo "5. 若小鸡出现 [INFECTED]，建议停机、备份必要业务数据、销毁重建。"
 
-if [ "$HOST_INFECTED" -eq 1 ] || [ "$ESCAPE_RISK" -eq 1 ] || [ "$CONTAINER_INFECTED_COUNT" -gt 0 ]; then
+if [ "$HOST_HIGH" -eq 1 ] || [ "$ESCAPE_RISK" -eq 1 ] || [ "$CONTAINER_INFECTED_COUNT" -gt 0 ]; then
   exit 2
 elif [ "$HOST_WARN" -eq 1 ] || [ "$CONTAINER_WARN_COUNT" -gt 0 ]; then
   exit 1
