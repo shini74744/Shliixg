@@ -6,7 +6,8 @@
 # 重点：
 #   1. 重点检查安装/运行哪吒监控的小鸡
 #   2. 小鸡公网远端 IP 数或公网连接数 >= 1000 时标记为疑似感染
-#   3. 母机不会因为 UID 1000000 这类容器映射用户出现可疑进程就直接判感染
+#   3. 小鸡内部只要发现乱码进程，例如 ???、????、??????，直接标记为疑似感染
+#   4. 母机不会因为 UID 1000000 这类容器映射用户出现可疑进程就直接判感染
 #
 # 用法：
 #   bash nezhajc.sh
@@ -541,6 +542,23 @@ if [ "$SCAN_CONTAINER" -eq 1 ]; then
       fi
 
       echo
+      echo "----- 乱码进程检测 -----"
+      C_GARBLED="$(run_in_container "$cname" '
+        {
+          ps -eo pid,ppid,user,stat,comm,args 2>/dev/null || ps auxww 2>/dev/null || ps 2>/dev/null
+        } | awk "NR==1 {next} {print}" | grep -E "\?{3,}" | head -80
+      ' || true)"
+
+      if [ -n "$C_GARBLED" ]; then
+        echo "$C_GARBLED"
+        C_HIGH=1
+        C_REASON="${C_REASON} 乱码进程"
+        high "$cname 发现乱码进程，直接判定为疑似感染"
+      else
+        ok "$cname 未发现乱码进程"
+      fi
+
+      echo
       echo "----- 小鸡公网远端 IP / 连接数量检查，阈值 ${CONN_THRESHOLD} -----"
       C_CONN="$(run_in_container "$cname" '
         TMPF="/tmp/.nezhajc_conn_ips.$$"
@@ -783,9 +801,10 @@ echo "2. 母机只有命中 root 强特征进程、恶意 ld.so.preload、母机
 echo "3. 小鸡安装/运行哪吒会显示为 [哪吒小鸡]，并重点扫描哪吒目录、哪吒服务、哪吒进程、哪吒配置。"
 echo "4. 小鸡公网远端 IP 数或公网连接数 >= ${CONN_THRESHOLD} 时，直接标记为疑似感染。"
 echo "5. 小鸡出现 /tmp/SystemLog、/tmp/b、download.sh、ice.sh、harvest.sh、xmrig.sh、ld.so.preload、可疑 cron、下载执行命令，直接标记为疑似感染。"
-echo "6. authorized_keys 和历史命令默认只标记 WARN，需要人工确认。"
-echo "7. 使用 --nezha-only 可以只扫描安装/运行哪吒的小鸡。"
-echo "8. 没有脚本能 100% 证明系统绝对干净。"
+echo "6. 小鸡内部只要发现乱码进程，例如 ???、????、??????，直接标记为疑似感染。"
+echo "7. authorized_keys 和历史命令默认只标记 WARN，需要人工确认。"
+echo "8. 使用 --nezha-only 可以只扫描安装/运行哪吒的小鸡。"
+echo "9. 没有脚本能 100% 证明系统绝对干净。"
 
 if [ "$HOST_HIGH" -eq 1 ] || [ "$ESCAPE_RISK" -eq 1 ] || [ "$CONTAINER_INFECTED_COUNT" -gt 0 ]; then
   exit 2
