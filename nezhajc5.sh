@@ -1,28 +1,7 @@
 #!/usr/bin/env bash
 # nezhajc1.sh
-# Incus/LXC 小鸡哪吒 agent 被黑专项检测脚本
+# Incus/LXC 哪吒 agent 被黑专项检测脚本
 # 只读检测：不删除、不杀进程、不修改配置
-#
-# 检测重点：
-#   1. 重点检查安装/运行哪吒 agent 的小鸡
-#   2. 只检查本次哪吒被黑相关强特征
-#   3. 乱码进程直接判疑似感染
-#   4. 多台感染小鸡会全部显示
-#   5. 普通 cron、普通启动项、普通 /tmp、普通 curl/wget、普通 authorized_keys 不直接判感染
-#
-# 用法：
-#   bash nezhajc1.sh
-#   bash nezhajc1.sh --nezha-only
-#   bash nezhajc1.sh --quiet-ok
-#   bash nezhajc1.sh --no-color
-#
-# 环境变量：
-#   CONN_THRESHOLD=1000 bash nezhajc1.sh
-#
-# 退出码：
-#   0 = 未发现明显感染痕迹
-#   1 = 存在可疑项
-#   2 = 存在疑似感染小鸡
 
 set +e
 export LC_ALL=C
@@ -106,19 +85,13 @@ WARN_LIST=""
 SKIPPED_LIST=""
 CONN_RANK_LIST=""
 
-# 这次已知相关恶意 IP
 KNOWN_IP_RE='86\.54\.82\.179|152\.42\.182\.35'
 
-# 只针对已知强恶意文件名，不再匹配普通 /tmp、普通 sh、普通 curl/wget
-MAL_FILE_RE='/(SystemLog|b|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|xmrig|kinsing|kdevtmpfsi|recvp\.php)([[:space:]]|$)'
+BAD_NAME_RE='SystemLog|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|xmrig|kinsing|kdevtmpfsi|recvp\.php'
 
-# 强命令特征：
-# 1. curl/wget 管道执行 sh/bash
-# 2. /tmp/SystemLog、/tmp/b
-# 3. download.sh、ice.sh、harvest.sh、xmrig.sh
-# 4. xmrig、stratum+tcp、recvp.php
-# 5. 写入 root authorized_keys 的后门行为
-MAL_CMD_RE='(curl|wget).*\|[[:space:]]*(sh|bash)|/tmp/SystemLog|(^|[[:space:]])/tmp/b([[:space:]]|$)|(^|[[:space:]])/tmp/(download\.sh|ice\.sh|harvest\.sh|xmrig\.sh)([[:space:]]|$)|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|(^|[[:space:]])xmrig([[:space:]]|$)|stratum\+tcp|recvp\.php|(>>|>|tee).*authorized_keys'
+BAD_PROC_RE='/tmp/SystemLog|(^|[[:space:]])/tmp/b([[:space:]]|$)|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|(^|[[:space:]])xmrig([[:space:]]|$)|stratum\+tcp|recvp\.php|86\.54\.82\.179|152\.42\.182\.35'
+
+BAD_CRON_START_RE='/tmp/SystemLog|(^|[[:space:]])/tmp/b([[:space:]]|$)|download\.sh|ice\.sh|harvest\.sh|xmrig\.sh|(^|[[:space:]])xmrig([[:space:]]|$)|stratum\+tcp|recvp\.php|86\.54\.82\.179|152\.42\.182\.35'
 
 section() {
   echo
@@ -312,7 +285,7 @@ while IFS=, read -r cname cstatus; do
   echo "----- 当前进程：哪吒被黑强特征 -----"
   C_PROC_BAD="$(run_in_container "$cname" "
     ps auxww 2>/dev/null \
-      | grep -Eia '${MAL_CMD_RE}|${KNOWN_IP_RE}' \
+      | grep -Eia '${BAD_PROC_RE}' \
       | grep -vE 'grep|nezhajc' \
       | head -120
   " || true)"
@@ -326,11 +299,12 @@ while IFS=, read -r cname cstatus; do
 
   echo
   echo "----- 临时目录：哪吒被黑相关恶意文件 -----"
-  C_TMP_BAD="$(run_in_container "$cname" "
-    find /tmp /var/tmp /dev/shm -type f -ls 2>/dev/null \
-      | grep -Eia '${MAL_FILE_RE}' \
-      | head -120
-  " || true)"
+  C_TMP_BAD="$(run_in_container "$cname" '
+    {
+      find /tmp -type f \( -name "SystemLog" -o -name "b" -o -name "download.sh" -o -name "ice.sh" -o -name "harvest.sh" -o -name "xmrig.sh" -o -name "xmrig" -o -name "kinsing" -o -name "kdevtmpfsi" -o -name "recvp.php" \) -ls 2>/dev/null
+      find /var/tmp /dev/shm -type f \( -name "SystemLog" -o -name "download.sh" -o -name "ice.sh" -o -name "harvest.sh" -o -name "xmrig.sh" -o -name "xmrig" -o -name "kinsing" -o -name "kdevtmpfsi" -o -name "recvp.php" \) -ls 2>/dev/null
+    } | head -120
+  ' || true)"
 
   if [ -n "$C_TMP_BAD" ]; then
     echo "$C_TMP_BAD"
@@ -343,8 +317,8 @@ while IFS=, read -r cname cstatus; do
   echo "----- 哪吒目录：恶意脚本/IP/下载执行痕迹 -----"
   C_NEZHA_BAD="$(run_in_container "$cname" "
     {
-      find /opt/nezha /etc/nezha -type f -ls 2>/dev/null
-      grep -RInE '${MAL_CMD_RE}|${KNOWN_IP_RE}' /opt/nezha /etc/nezha 2>/dev/null
+      find /opt/nezha /etc/nezha -type f \( -name 'SystemLog' -o -name 'b' -o -name 'download.sh' -o -name 'ice.sh' -o -name 'harvest.sh' -o -name 'xmrig.sh' -o -name 'xmrig' -o -name 'kinsing' -o -name 'kdevtmpfsi' -o -name 'recvp.php' \) -ls 2>/dev/null
+      grep -RInE '${KNOWN_IP_RE}|${BAD_CRON_START_RE}' /opt/nezha /etc/nezha 2>/dev/null
     } | head -180
   " || true)"
 
@@ -355,36 +329,40 @@ while IFS=, read -r cname cstatus; do
     ok "$cname 哪吒目录未命中被黑相关特征"
   fi
 
-  echo
-  echo "----- cron：只检查哪吒被黑强特征 -----"
-  C_CRON_BAD="$(run_in_container "$cname" "
-    {
-      crontab -l 2>/dev/null
-      grep -RInE '${MAL_CMD_RE}|${KNOWN_IP_RE}' /etc/cron* /etc/crontabs /etc/periodic /var/spool/cron* 2>/dev/null
-    } | head -180
-  " || true)"
+  if [ "$C_NEZHA" = "是" ]; then
+    echo
+    echo "----- cron：仅哪吒小鸡检查强特征 -----"
+    C_CRON_BAD="$(run_in_container "$cname" "
+      {
+        crontab -l 2>/dev/null
+        grep -RInE '${KNOWN_IP_RE}|${BAD_CRON_START_RE}' /etc/cron* /etc/crontabs /etc/periodic /var/spool/cron* 2>/dev/null
+      } | head -180
+    " || true)"
 
-  if [ -n "$C_CRON_BAD" ]; then
-    echo "$C_CRON_BAD"
-    add_reason "cron 命中哪吒被黑强特征"
+    if [ -n "$C_CRON_BAD" ]; then
+      echo "$C_CRON_BAD"
+      add_reason "cron 命中哪吒被黑强特征"
+    else
+      ok "$cname cron 未命中哪吒被黑强特征"
+    fi
+
+    echo
+    echo "----- 启动项：仅哪吒小鸡检查强特征 -----"
+    C_START_BAD="$(run_in_container "$cname" "
+      grep -RInE '${KNOWN_IP_RE}|${BAD_CRON_START_RE}' \
+        /etc/systemd/system /lib/systemd/system /etc/init.d /etc/runlevels \
+        /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null \
+        | head -180
+    " || true)"
+
+    if [ -n "$C_START_BAD" ]; then
+      echo "$C_START_BAD"
+      add_reason "启动项命中哪吒被黑强特征"
+    else
+      ok "$cname 启动项未命中哪吒被黑强特征"
+    fi
   else
-    ok "$cname cron 未命中哪吒被黑强特征"
-  fi
-
-  echo
-  echo "----- 启动项：只检查哪吒被黑强特征 -----"
-  C_START_BAD="$(run_in_container "$cname" "
-    grep -RInE '${MAL_CMD_RE}|${KNOWN_IP_RE}' \
-      /etc/systemd/system /lib/systemd/system /etc/init.d /etc/runlevels \
-      /etc/profile /etc/profile.d /root/.bashrc /root/.profile 2>/dev/null \
-      | head -180
-  " || true)"
-
-  if [ -n "$C_START_BAD" ]; then
-    echo "$C_START_BAD"
-    add_reason "启动项命中哪吒被黑强特征"
-  else
-    ok "$cname 启动项未命中哪吒被黑强特征"
+    ok "$cname 未安装哪吒 agent，跳过 cron / 启动项感染判定，避免干净系统误报"
   fi
 
   echo
@@ -535,15 +513,16 @@ echo
 echo "判定规则："
 echo "1. 本脚本只针对这次哪吒 agent 被黑相关强特征做专项检测。"
 echo "2. 普通 cron、普通启动项、普通 /tmp、普通 curl/wget、普通 authorized_keys 不再直接判定感染。"
-echo "3. 小鸡安装/运行哪吒 agent 会显示为 [哪吒小鸡]，并重点扫描哪吒目录、哪吒进程、哪吒配置。"
-echo "4. 小鸡内部发现乱码进程，例如 ???、????、{}，直接标记为疑似感染。"
-echo "5. 小鸡出现 /tmp/SystemLog、/tmp/b、download.sh、ice.sh、harvest.sh、xmrig.sh、recvp.php，直接标记为疑似感染。"
-echo "6. 小鸡命中 86.54.82.179 或 152.42.182.35，直接标记为疑似感染。"
-echo "7. cron 或启动项只有出现 curl/wget 管道执行 sh/bash、恶意脚本名、写入 authorized_keys 等强特征时，才标记为疑似感染。"
-echo "8. 小鸡公网远端 IP 数或公网连接数 >= ${CONN_THRESHOLD} 时，直接标记为疑似感染。"
-echo "9. 多台小鸡感染会在“疑似感染小鸡列表”中全部显示。"
-echo "10. 使用 --nezha-only 可以只扫描安装/运行哪吒 agent 的小鸡。"
-echo "11. 没有脚本能 100% 证明系统绝对干净。"
+echo "3. 未安装哪吒 agent 的小鸡，不再因为 cron / 启动项内容判定感染。"
+echo "4. 小鸡安装/运行哪吒 agent 会显示为 [哪吒小鸡]，并重点扫描哪吒目录、哪吒进程、哪吒配置。"
+echo "5. 小鸡内部发现乱码进程，例如 ???、????、{}，直接标记为疑似感染。"
+echo "6. 小鸡出现 /tmp/SystemLog、/tmp/b、download.sh、ice.sh、harvest.sh、xmrig.sh、recvp.php，直接标记为疑似感染。"
+echo "7. 小鸡命中 86.54.82.179 或 152.42.182.35，直接标记为疑似感染。"
+echo "8. 已安装哪吒 agent 的小鸡，cron / 启动项只有命中固定恶意文件名或固定恶意 IP 时才标记为疑似感染。"
+echo "9. 小鸡公网远端 IP 数或公网连接数 >= ${CONN_THRESHOLD} 时，直接标记为疑似感染。"
+echo "10. 多台小鸡感染会在“疑似感染小鸡列表”中全部显示。"
+echo "11. 使用 --nezha-only 可以只扫描安装/运行哪吒 agent 的小鸡。"
+echo "12. 没有脚本能 100% 证明系统绝对干净。"
 
 if [ "$INFECTED_COUNT" -gt 0 ]; then
   exit 2
