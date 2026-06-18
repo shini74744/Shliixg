@@ -2667,7 +2667,7 @@ _uninstall() {
 _initialize_config_files() {
     mkdir -p ${SINGBOX_DIR}
     if [ ! -s "$CONFIG_FILE" ]; then
-        # 初始化包含完整 dns 配置和路由策略的基础文件，以支持中转第三方域名节点，防污染并规避 IPv6 握手黑洞问题
+        # 初始化包含对方脚本同款本地 DNS 配置和路由策略的基础文件，优先兼容低配/精简系统并规避 IPv6 握手黑洞问题
         cat > "$CONFIG_FILE" << 'EOF'
 {
   "ntp": {
@@ -2679,20 +2679,15 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-cloudflare",
-        "address": "https://1.1.1.1/dns-query",
-        "detour": "direct"
-      },
-      {
-        "tag": "dns-aliyun",
-        "address": "https://223.5.5.5/dns-query",
+        "tag": "dns-local",
+        "address": "local",
         "detour": "direct"
       }
     ],
     "rules": [
       {
         "outbound": "any",
-        "server": "dns-cloudflare"
+        "server": "dns-local"
       }
     ],
     "strategy": "ipv4_only"
@@ -2861,40 +2856,47 @@ _cleanup_legacy_config() {
 }
 
 _check_and_fix_dns() {
-    # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 并且全面升级为 DoH (阿里 + CF) 与 ipv4_only 策略防止被污染的域名解析打孔失败
+    # 热修复：1.补充/收敛 DNS 模块为对方脚本同款 local DNS，2.清除容易引起出站路由绑定死循环的 auto_detect_interface
+    # DNS 目标形态：dns-local / address=local / detour=direct / ipv4_only
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
-    
-    local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
-    local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
-    local needs_restart=false
-    
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ]; then
-        _warn "检测到您的配置文件存在影响节点转发的底层隐患 (缺乏防污染 DNS / 启用了不良路由)，正在自动修复..."
-        
+
+    local has_dns has_auto_detect needs_restart=false
+    has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
+    has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
+
+    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || \
+       ! jq -e 'try (
+            (.dns.servers | length == 1) and
+            (.dns.servers[0].tag == "dns-local") and
+            (.dns.servers[0].address == "local") and
+            (.dns.servers[0].detour == "direct") and
+            (.dns.rules | length == 1) and
+            (.dns.rules[0].outbound == "any") and
+            (.dns.rules[0].server == "dns-local") and
+            (.dns.strategy == "ipv4_only")
+        ) catch false' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "检测到配置文件 DNS/路由与当前模板不一致，正在自动修复为 dns-local/local/ipv4_only..."
+
         local tmp_file="${CONFIG_FILE}.tmp"
-        # 1. 注入现代防污染 DNS 2. 移除自动网卡探测
-        jq '. + {
-            "dns": {
+        jq '.dns = {
                 "servers": [
-                    {"tag": "dns-cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
-                    {"tag": "dns-aliyun", "address": "https://223.5.5.5/dns-query", "detour": "direct"}
+                    {"tag": "dns-local", "address": "local", "detour": "direct"}
                 ],
-                "rules": [{"outbound": "any", "server": "dns-cloudflare"}],
+                "rules": [{"outbound": "any", "server": "dns-local"}],
                 "strategy": "ipv4_only"
             }
-        } | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
-        
+            | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
+
         if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
             mv "$tmp_file" "$CONFIG_FILE"
-            _success "高级 DNS 与路由参数热修复完成！"
+            _success "DNS 与路由参数热修复完成：dns-local / local / direct / ipv4_only。"
             needs_restart=true
         else
-            _error "高级修复应用失败！"
+            _error "DNS 与路由参数修复失败！"
             rm -f "$tmp_file"
         fi
     fi
-    
+
     if [ "$needs_restart" == "true" ]; then
         return 0
     fi
