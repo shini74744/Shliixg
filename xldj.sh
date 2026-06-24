@@ -5553,6 +5553,7 @@ _main_menu() {
         echo -e "  ${RED}禁止滥用${NC}"
         echo -e "  ${RED}禁止机场接入${NC}"
         echo -e "  ${RED}禁止风险操作${NC}"
+        echo -e "  ${RED}如是动态家宽产品线 请注意替换前置IP使用${NC}"
         echo ""
         
         # 获取系统信息
