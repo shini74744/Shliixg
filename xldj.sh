@@ -83,7 +83,7 @@ set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15.7-shlii-brand-shortcut-tip"
+export SCRIPT_VERSION="15.8-shlii-dns114-fix"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
@@ -92,10 +92,8 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main}"
 SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/xldj.sh}"
 
-# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
-export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
-export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
-export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
+# DNS 使用 sing-box 1.12+ 新格式；1.14 已删除旧格式，不能再依赖弃用兼容环境变量。
+# 修复范围：DNS 模板/迁移、合并配置检查、核心更新预检；不改协议、域名池和节点凭据。
 # 默认采用自动策略：单协议走 single，增加节点/重协议自动走 multi；需要强保连通时可执行 continuity-mode。
 export SB_STABILITY_MODE="${SB_STABILITY_MODE:-auto}"
 # 安装/下载防卡死超时：避免 apt/apk/wget/curl 在网络异常、包管理锁、GitHub 连接异常时无限等待。
@@ -455,6 +453,15 @@ _init_server_ip() {
 # 统一服务管理
 _manage_service() {
     local action="$1"
+    [ -z "$INIT_SYSTEM" ] && _detect_init_system
+
+    # 启动/重启前先安全迁移旧 DNS；失败时不能停止现有进程。
+    if [[ "$action" == "restart" || "$action" == "start" ]]; then
+        local dns_rc
+        _check_and_fix_dns
+        dns_rc=$?
+        [ "$dns_rc" -le 1 ] || return 1
+    fi
 
     # [关键核心修复] 动态注入内置 NTP 时间同步模块
     # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
@@ -464,6 +471,8 @@ _manage_service() {
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
         fi
+        # NTP/运行参数处理完成后再次校验，校验失败不发出 stop/restart。
+        _validate_singbox_config || return 1
     fi
 
     [ -z "$INIT_SYSTEM" ] && _detect_init_system
@@ -1082,15 +1091,8 @@ _apply_low_mem_optimizations() {
           .log.disabled = false
         ' 2>/dev/null || true
 
-        if [ "$mem_mb" -le 256 ]; then
-            _atomic_modify_json "$CONFIG_FILE" '
-              if .dns then
-                .dns.independent_cache = false
-              else
-                .
-              end
-            ' 2>/dev/null || true
-        fi
+        # 1.14 起 DNS 缓存固定按服务器区分，不再反复写入已弃用的 independent_cache。
+        # 不强制改写自定义 DNS 缓存策略；旧模板中的 false 由 DNS 迁移函数清理。
     fi
 
     if [ -f "$LOG_FILE" ]; then
@@ -1395,11 +1397,36 @@ _install_sing_box() {
 
     rm -f "$archive_path"
 
+    if ! chmod +x "$extracted_bin" || ! "$extracted_bin" version >/dev/null 2>&1; then
+        _error "下载的核心无法执行，未替换原核心。临时目录：$temp_dir"
+        return 1
+    fi
+    if [ -s "$CONFIG_FILE" ]; then
+        local candidate_config="${temp_dir}/config.dns-candidate.json"
+        _info "升级前预检：用候选核心检查迁移后的主配置和中转配置..."
+        if ! _build_dns_migration_candidate "$CONFIG_FILE" "$candidate_config" || \
+           ! _validate_singbox_config "$extracted_bin" "$candidate_config"; then
+            _error "新核心与现有配置不兼容，原核心和原配置未替换。临时目录：$temp_dir"
+            return 1
+        fi
+    fi
+
     _info "正在安装 sing-box 二进制文件..."
     mkdir -p "$(dirname "$SINGBOX_BIN")" || {
         _error "创建安装目录失败: $(dirname "$SINGBOX_BIN")"
         return 1
     }
+    # 保留旧核心供人工回退；不自动删除历史备份。
+    if [ -f "$SINGBOX_BIN" ]; then
+        local binary_backup
+        binary_backup=$(mktemp "${SINGBOX_BIN}.bak.XXXXXX") || return 1
+        if ! cp -p "$SINGBOX_BIN" "$binary_backup"; then
+            rm -f "$binary_backup"
+            _error "备份旧核心失败，取消替换。"
+            return 1
+        fi
+        _info "旧核心备份：$binary_backup"
+    fi
     if ! mv -f "$extracted_bin" "$SINGBOX_BIN"; then
         _error "安装 sing-box 二进制文件失败: $SINGBOX_BIN"
         _error "临时目录保留: $temp_dir"
@@ -2450,9 +2477,6 @@ Environment="GOMAXPROCS=${gomax}"
 Environment="GODEBUG=madvdontneed=1"
 Environment="MALLOC_ARENA_MAX=1"
 Environment="SB_LOWMEM_MODE=${mode}"
-Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
-Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
-Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=/bin/sh -c 'if [ -s "${SINGBOX_DIR}/relay.json" ]; then exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json"; else exec "${SINGBOX_BIN}" run -c "${CONFIG_FILE}"; fi'
 Restart=on-failure
 RestartSec=2s
@@ -2486,7 +2510,7 @@ command="/bin/sh"
 command_args='-c "if [ -s ${SINGBOX_DIR}/relay.json ]; then exec ${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json; else exec ${SINGBOX_BIN} run -c ${CONFIG_FILE}; fi"'
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${gogc} --env GOMAXPROCS=${gomax} --env GODEBUG=madvdontneed=1 --env MALLOC_ARENA_MAX=1 --env SB_LOWMEM_MODE=${mode} --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=${gogc} --env GOMAXPROCS=${gomax} --env GODEBUG=madvdontneed=1 --env MALLOC_ARENA_MAX=1 --env SB_LOWMEM_MODE=${mode}"
 respawn_delay=3
 respawn_max=0
 rc_ulimit="-n ${nofile}"
@@ -2667,7 +2691,7 @@ _uninstall() {
 _initialize_config_files() {
     mkdir -p ${SINGBOX_DIR}
     if [ ! -s "$CONFIG_FILE" ]; then
-        # 初始化包含对方脚本同款本地 DNS 配置和路由策略的基础文件，优先兼容低配/精简系统并规避 IPv6 握手黑洞问题
+        # 使用 1.12+ 类型化本地 DNS，兼容 1.14；保留原模板的 IPv4-only 策略。
         cat > "$CONFIG_FILE" << 'EOF'
 {
   "ntp": {
@@ -2679,17 +2703,12 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
+        "type": "local",
+        "tag": "dns-local"
       }
     ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
-      }
-    ],
+    "rules": [],
+    "final": "dns-local",
     "strategy": "ipv4_only"
   },
   "inbounds": [],
@@ -2701,7 +2720,11 @@ _initialize_config_files() {
   ],
   "route": {
     "rules": [],
-    "final": "direct"
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "dns-local",
+      "strategy": "ipv4_only"
+    }
   }
 }
 EOF
@@ -2855,53 +2878,126 @@ _cleanup_legacy_config() {
     return 1
 }
 
-_check_and_fix_dns() {
-    # 热修复：1.补充/收敛 DNS 模块为对方脚本同款 local DNS，2.清除容易引起出站路由绑定死循环的 auto_detect_interface
-    # DNS 目标形态：dns-local / address=local / detour=direct / ipv4_only
-    if [ ! -f "$CONFIG_FILE" ]; then return; fi
+# DNS 迁移及校验（只处理本脚本已知的简单 local 模板；不重置自定义分流）。
+# 这些辅助函数不启动服务、不安装软件，也不改 /etc/resolv.conf。
+_validate_singbox_config() {
+    local bin="${1:-$SINGBOX_BIN}"
+    local cfg="${2:-$CONFIG_FILE}"
+    local relay="${3:-${SINGBOX_DIR}/relay.json}"
+    local result rc
+    local args=(check -c "$cfg")
 
-    local has_dns has_auto_detect needs_restart=false
-    has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
-    has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
-
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || \
-       ! jq -e 'try (
-            (.dns.servers | length == 1) and
-            (.dns.servers[0].tag == "dns-local") and
-            (.dns.servers[0].address == "local") and
-            (.dns.servers[0].detour == "direct") and
-            (.dns.rules | length == 1) and
-            (.dns.rules[0].outbound == "any") and
-            (.dns.rules[0].server == "dns-local") and
-            (.dns.strategy == "ipv4_only")
-        ) catch false' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _warn "检测到配置文件 DNS/路由与当前模板不一致，正在自动修复为 dns-local/local/ipv4_only..."
-
-        local tmp_file="${CONFIG_FILE}.tmp"
-        jq '.dns = {
-                "servers": [
-                    {"tag": "dns-local", "address": "local", "detour": "direct"}
-                ],
-                "rules": [{"outbound": "any", "server": "dns-local"}],
-                "strategy": "ipv4_only"
-            }
-            | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
-
-        if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
-            mv "$tmp_file" "$CONFIG_FILE"
-            _success "DNS 与路由参数热修复完成：dns-local / local / direct / ipv4_only。"
-            needs_restart=true
-        else
-            _error "DNS 与路由参数修复失败！"
-            rm -f "$tmp_file"
-        fi
+    if [ ! -x "$bin" ] || [ ! -s "$cfg" ]; then
+        _error "核心不可执行或主配置不存在：$bin / $cfg"
+        return 1
     fi
-
-    if [ "$needs_restart" == "true" ]; then
-        return 0
+    # 与 systemd / OpenRC 的实际启动参数一致，避免漏查中转配置。
+    [ -s "$relay" ] && args+=(-c "$relay")
+    result=$(_with_timeout_label "${SB_CONFIG_CHECK_TIMEOUT:-30}" "检查 sing-box 合并配置" "$bin" "${args[@]}" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _error "配置校验失败；不会继续本次启动或核心替换。"
+        printf '%s\n' "$result" >&2
+        return "$rc"
     fi
-    return 1
+    # 也显示成功校验时的弃用警告，不再把警告静默吞掉。
+    [ -z "$result" ] || printf '%s\n' "$result" >&2
+    return 0
 }
+
+_build_dns_migration_candidate() {
+    local src="$1" dst="$2"
+    local relay="${SINGBOX_DIR}/relay.json"
+    local relay_has_dns=false
+
+    command -v jq >/dev/null 2>&1 || { _error "缺少 jq，无法安全迁移 DNS。"; return 1; }
+    # 拒绝损坏 JSON 或多个顶层文档，不能用默认模板掩盖原始错误。
+    jq -e -s 'length == 1 and (.[0] | type == "object")' "$src" >/dev/null 2>&1 || {
+        _error "主配置不是有效的单个 JSON 对象，保留原文件：$src"
+        return 1
+    }
+    if [ -s "$relay" ] && jq -e '(.dns.servers // []) | length > 0' "$relay" >/dev/null 2>&1; then
+        relay_has_dns=true
+    fi
+
+    jq --argjson relay_has_dns "$relay_has_dns" '
+      def old_default_local:
+        (.dns | type == "object") and
+        (.dns.servers | type == "array" and length == 1) and
+        (.dns.servers[0] | (
+          . == {"tag":"dns-local","address":"local","detour":"direct"} or
+          . == {"tag":"dns-local","address":"local"}
+        )) and
+        ((.dns.rules // []) == [] or
+         (.dns.rules == [{"outbound":"any","server":"dns-local"}]));
+
+      if ((.dns == null) and ($relay_has_dns | not)) then
+        .dns = {
+          "servers":[{"type":"local","tag":"dns-local"}],
+          "rules":[], "final":"dns-local", "strategy":"ipv4_only"
+        } |
+        .route.default_domain_resolver //= {"server":"dns-local","strategy":"ipv4_only"}
+      elif old_default_local then
+        # 只换已识别的旧模板：不动入站、出站、现有路由规则或已有解析器设置。
+        .dns.servers[0] = {"type":"local","tag":"dns-local"} |
+        .dns.rules = [] |
+        .dns.final //= "dns-local" |
+        .dns.strategy //= "ipv4_only" |
+        .route.default_domain_resolver //= {"server":"dns-local","strategy":.dns.strategy} |
+        (if .dns.independent_cache == false then del(.dns.independent_cache) else . end)
+      else
+        # 自定义 DNS / 已迁移的新配置不强制覆盖；其兼容性由核心 check 判断。
+        .
+      end
+    ' "$src" > "$dst"
+}
+
+_check_and_fix_dns() {
+    # 返回值：0=已迁移，1=无需修改，2=迁移或校验失败。
+    # 仅在候选配置通过“主配置 + relay.json”校验后备份并原子替换。
+    [ -s "$CONFIG_FILE" ] || return 1
+    local tmp_file backup stamp
+    tmp_file=$(mktemp "${CONFIG_FILE}.dns-migrate.XXXXXX") || {
+        _error "无法创建 DNS 迁移临时文件。"
+        return 2
+    }
+    if ! _build_dns_migration_candidate "$CONFIG_FILE" "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 2
+    fi
+    if jq -e -s '.[0] == .[1]' "$CONFIG_FILE" "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    _info "检测到旧版默认 DNS 模板，正在迁移至 type=local / default_domain_resolver..."
+    if ! _validate_singbox_config "$SINGBOX_BIN" "$tmp_file"; then
+        _error "DNS 迁移未应用，原配置保持不变。新 DNS 格式要求 sing-box 1.12+。"
+        rm -f "$tmp_file"
+        return 2
+    fi
+
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup=$(mktemp "${CONFIG_FILE}.bak.dns-${stamp}.XXXXXX") || {
+        rm -f "$tmp_file"
+        _error "无法创建配置备份，取消迁移。"
+        return 2
+    }
+    if ! cp -p "$CONFIG_FILE" "$backup"; then
+        rm -f "$tmp_file" "$backup"
+        _error "备份配置失败，取消迁移。"
+        return 2
+    fi
+    if ! mv -f "$tmp_file" "$CONFIG_FILE"; then
+        rm -f "$tmp_file"
+        _error "写入迁移配置失败；备份位于：$backup"
+        return 2
+    fi
+    _success "DNS 已迁移；保留现有节点、分流和 IPv4 策略。备份：$backup"
+    return 0
+}
+
+export -f _validate_singbox_config _build_dns_migration_candidate _check_and_fix_dns
 
 _generate_self_signed_cert() {
     local domain="$1"
@@ -4620,16 +4716,12 @@ _delete_node() {
 }
 
 _check_config() {
-    _info "正在检查 sing-box 配置文件..."
-    # 捕获所有输出（包括 stderr 产生的大量 WARN 和 TRACE 弃用警告）
-    local result
-    result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE} 2>&1)
-    if [[ $? -eq 0 ]]; then
-        _success "配置文件 (${CONFIG_FILE}) 格式正确。"
-    else
-        _error "配置文件检查失败:"
-        echo "$result"
+    _info "正在检查 sing-box 主配置及实际加载的 relay.json..."
+    if _validate_singbox_config; then
+        _success "合并配置校验通过（不代表 DNS 网络连通性已验证）。"
+        return 0
     fi
+    return 1
 }
 
 _modify_port() {
@@ -5058,8 +5150,11 @@ _do_update_singbox() {
         fi
         _create_service_files
         _info "正在启动/重启 [主] 服务 (sing-box)..."
-        _manage_service "restart"
-        _success "[主] 服务已就绪。"
+        if ! _manage_service "restart"; then
+            _error "核心已安装，但主服务启动/重启失败；请检查上方错误及运行日志。"
+            return 1
+        fi
+        _success "[主] 服务启动/重启命令已成功执行，请通过运行状态与日志确认持续运行。"
     else
         _error "Sing-box 核心安装/更新失败。"
     fi
@@ -6158,9 +6253,14 @@ main() {
             config_updated=true
         fi
         
-        # 3.3 [热修复] 检测并补充 DNS 模块
-        if _check_and_fix_dns; then
+        # 3.3 安全迁移旧 DNS；不再将已迁移或自定义 DNS 改回旧模板。
+        local dns_fix_rc
+        _check_and_fix_dns
+        dns_fix_rc=$?
+        if [ "$dns_fix_rc" -eq 0 ]; then
             config_updated=true
+        elif [ "$dns_fix_rc" -ne 1 ]; then
+            _warn "DNS 自动迁移失败，未应用 DNS 候选配置；可用菜单 [12] 查看合并配置错误。"
         fi
         
         if [ "$config_updated" = true ]; then
@@ -6211,6 +6311,30 @@ main() {
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        check-config|check-dns)
+            # 只读诊断不应触发原脚本退出时清理配置目录 *.tmp 的逻辑。
+            trap - EXIT
+            # 不进入主菜单，不迁移配置，不重启服务。
+            _require_singbox || exit 1
+            "$SINGBOX_BIN" version
+            _check_config
+            exit $?
+            ;;
+        fix-dns)
+            # 仅 DNS 迁移 + 服务重启；不更新核心、不安装依赖、不重新创建节点。
+            _check_root
+            _require_singbox || exit 1
+            command -v jq >/dev/null 2>&1 || { _error "请先安装 jq。"; exit 1; }
+            _detect_init_system
+            case "$INIT_SYSTEM" in
+                systemd|openrc) ;;
+                *) _error "未检测到 systemd/OpenRC，未执行 DNS 修复。"; exit 1 ;;
+            esac
+            _manage_service restart || exit 1
+            _install_cli_shortcut || _warn "快捷命令未更新，请直接使用此修复脚本。"
+            _success "DNS 迁移及服务重启命令已完成；可用 check-config 复查。"
+            exit 0
+            ;;
         keepalive)
             _argo_keepalive
             exit 0
