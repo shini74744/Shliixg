@@ -83,7 +83,7 @@ set -o pipefail
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="15.8-shlii-dns114-fix"
+export SCRIPT_VERSION="15.9-shlii-dns-safe"
 export DEFAULT_SNI_POOL="www.amd.com tesla.com www.tesla.com icloud.com www.icloud.com apple.com www.apple.com"
 export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s\n' "$0")"
@@ -93,7 +93,9 @@ GITHUB_RAW_BASE="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/0xdabiaoge
 SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/shini74744/Shliixg/refs/heads/main/xldj.sh}"
 
 # DNS 使用 sing-box 1.12+ 新格式；1.14 已删除旧格式，不能再依赖弃用兼容环境变量。
-# 修复范围：DNS 模板/迁移、合并配置检查、核心更新预检；不改协议、域名池和节点凭据。
+# 修复范围：类型化 DNS/保守迁移/引导解析/事务回滚，以及 LXC 校时保护。
+# 保留原协议限制、域名池、品牌、远程脚本地址；不默认打开 Clash IPv6。
+# 独立主机系统校时默认关闭；显式 SB_ALLOW_SYSTEM_TIME_SYNC=1 才允许，检测到容器仍跳过。
 # 默认采用自动策略：单协议走 single，增加节点/重协议自动走 multi；需要强保连通时可执行 continuity-mode。
 export SB_STABILITY_MODE="${SB_STABILITY_MODE:-auto}"
 # 安装/下载防卡死超时：避免 apt/apk/wget/curl 在网络异常、包管理锁、GitHub 连接异常时无限等待。
@@ -453,41 +455,12 @@ _init_server_ip() {
 # 统一服务管理
 _manage_service() {
     local action="$1"
-    [ -z "$INIT_SYSTEM" ] && _detect_init_system
-
-    # 启动/重启前先安全迁移旧 DNS；失败时不能停止现有进程。
-    if [[ "$action" == "restart" || "$action" == "start" ]]; then
-        local dns_rc
-        _check_and_fix_dns
-        dns_rc=$?
-        [ "$dns_rc" -le 1 ] || return 1
-    fi
-
-    # [关键核心修复] 动态注入内置 NTP 时间同步模块
-    # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
-    if [[ "$action" == "restart" || "$action" == "start" ]]; then
-        _refresh_dynamic_runtime_limits "sing-box" 2>/dev/null || true
-        if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
-            _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
-            _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
-        fi
-        # NTP/运行参数处理完成后再次校验，校验失败不发出 stop/restart。
-        _validate_singbox_config || return 1
-    fi
-
-    [ -z "$INIT_SYSTEM" ] && _detect_init_system
-    [ "$action" == "status" ] || _info "正在使用 ${INIT_SYSTEM} 执行: $action..."
-    case "$INIT_SYSTEM" in
-        systemd)
-            if [ "$action" == "status" ]; then systemctl status sing-box --no-pager -l; return; fi
-            _with_timeout 30 systemctl "$action" sing-box ;;
-        openrc)
-            if [ "$action" == "status" ]; then rc-service sing-box status; return; fi
-            _with_timeout 30 rc-service sing-box "$action" ;;
-        *) _error "不支持的服务管理系统" ;;
+    [ -n "$INIT_SYSTEM" ] || _detect_init_system
+    case "$action" in
+        start|restart) _dns_transaction "$action" ;;
+        *) _service_action_raw "$action" ;;
     esac
 }
-
 # Alpine 全球镜像自适应：避免 dl-cdn.alpinelinux.org 在部分 NAT/海外线路上长时间卡住。
 _alpine_release_branch() {
     local release=""
@@ -669,30 +642,49 @@ _atomic_modify_yaml() {
 # --- 资源与环境管理 ---
 
 # 系统时间同步 (解决 TLS 握手 EOF 问题)
-_sync_system_time() {
-    _info "正在检查并同步系统时间..."
-    local current_year=$(date +%Y)
-    [ "$current_year" -lt 2024 ] && _warning "系统时间滞后，正在强制同步..."
-    # 采用三级同步策略提升鲁棒性 (NTP -> HTTP -> Package)
-    if _pkg_install ntpdate >/dev/null 2>&1 && command -v ntpdate &>/dev/null; then
-        ntpdate -u ntp.aliyun.com >/dev/null 2>&1 || ntpdate -u pool.ntp.org >/dev/null 2>&1
-    elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        _pkg_install chrony >/dev/null 2>&1
-        chronyd -q 'server ntp.aliyun.com iburst' >/dev/null 2>&1
-    else
-        # 最后的屏障：通过 HTTP 头部修正时间 (防御 UDP 123 拦截)
-        local http_time=$(curl -sI --max-time 3 https://www.google.com | grep -i '^date:' | cut -f2- -d' ')
-        if [ -n "$http_time" ]; then
-            # [修复] 先尝试 GNU date 直接设置，失败后尝试 epoch 方式 (兼容 BusyBox)
-            if ! date -s "$http_time" >/dev/null 2>&1; then
-                local epoch=$(date -d "$http_time" +%s 2>/dev/null)
-                [ -n "$epoch" ] && date -s "@$epoch" >/dev/null 2>&1
-            fi
-        fi
+# --- 容器校时保护：不试探性写系统时钟，不依赖容器 root 是否有权限 ---
+_is_container_environment() {
+    [ -e /.dockerenv ] || [ -e /run/.containerenv ] || [ -e /proc/vz ] && return 0
+    [ -n "${container:-}" ] && return 0
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt --container --quiet 2>/dev/null && return 0
     fi
-    _info "当前时间：$(date)"
+    [ -s /run/systemd/container ] && return 0
+    grep -qaE '(lxc|docker|kubepods|containerd|libpod|podman)' /proc/1/cgroup /proc/self/cgroup 2>/dev/null && return 0
+    if [ -r /proc/1/environ ]; then
+        tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container=' && return 0
+    fi
+    return 1
 }
 
+_sync_system_time() {
+    _info "本机显示时间：$(date '+%Y-%m-%d %H:%M:%S %z')；UTC：$(date -u '+%Y-%m-%d %H:%M:%S')"
+    if _is_container_environment; then
+        _warn "检测到容器：跳过 ntpdate/chronyd/date -s，不修改母鸡系统时钟或本机时区。"
+        _info "sing-box 内置 NTP 可作程序内部补偿；实际同步状态请看运行日志。"
+        return 0
+    fi
+    # 默认不自动校时，避免检测不到的特殊容器误触宿主时钟；独立主机需显式允许。
+    if [ "${SB_ALLOW_SYSTEM_TIME_SYNC:-0}" != "1" ]; then
+        _info "自动系统校时默认关闭。独立主机确认允许后可执行：SB_ALLOW_SYSTEM_TIME_SYNC=1 xlddg sync-time"
+        return 0
+    fi
+    command -v timeout >/dev/null 2>&1 || { _error "缺少 timeout，未执行系统校时。"; return 1; }
+    if ! command -v ntpdate >/dev/null 2>&1; then
+        _pkg_install ntpdate || return 1
+    fi
+    command -v ntpdate >/dev/null 2>&1 || { _error "ntpdate 不可用。"; return 1; }
+    local server
+    for server in ntp.aliyun.com pool.ntp.org; do
+        if timeout 15 ntpdate -u "$server"; then
+            _success "系统校时命令成功：$(date)"
+            return 0
+        fi
+    done
+    _error "系统校时失败。没有使用 HTTP Date 头强行改钟，也没有修改时区。"
+    return 1
+}
+export -f _is_container_environment
 # Clash YAML 节点管理
 _get_proxy_field() {
     local proxy_name="$1" field="$2"
@@ -1092,7 +1084,7 @@ _apply_low_mem_optimizations() {
         ' 2>/dev/null || true
 
         # 1.14 起 DNS 缓存固定按服务器区分，不再反复写入已弃用的 independent_cache。
-        # 不强制改写自定义 DNS 缓存策略；旧模板中的 false 由 DNS 迁移函数清理。
+        # 保留其他自定义缓存选项；1.14 的 independent_cache 由 DNS 迁移按核心版本统一清理。
     fi
 
     if [ -f "$LOG_FILE" ]; then
@@ -1128,7 +1120,10 @@ _refresh_dynamic_runtime_limits() {
     [ "${SB_REFRESHING_RUNTIME_LIMITS:-0}" = "1" ] && return 0
     export SB_REFRESHING_RUNTIME_LIMITS=1
 
-    _apply_low_mem_optimizations 2>/dev/null || true
+    # DNS 事务已校验 JSON 时，仅刷新 unit/init 限制，避免另行重写配置。
+    if [ "${SB_PRESERVE_RUNTIME_CONFIG:-0}" != "1" ]; then
+        _apply_low_mem_optimizations 2>/dev/null || true
+    fi
 
     if [ "$scope" = "all" ] || [ "$scope" = "sing-box" ]; then
         if [ -n "$SERVICE_FILE" ] && [ -f "$SINGBOX_BIN" ]; then
@@ -1259,13 +1254,13 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _with_timeout _with_timeout_label _download_file _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _alpine_release_branch _alpine_current_repo_bases _alpine_candidate_repo_bases _alpine_write_repositories _alpine_prepare_repositories _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning _alpine_bootstrap_before_init _install_cli_shortcut _ensure_cron_available
+export -f _with_timeout _with_timeout_label _download_file _assert_supported_os _detect_supported_distro _cpu_count _file_size_bytes _is_systemd_usable _is_openrc_usable _info _success _warn _warning _error _url_encode _url_decode _get_random_sni _get_public_ip _detect_init_system _sync_system_time _is_container_environment _release_install_cache _atomic_modify_json _atomic_modify_json_arg _atomic_modify_yaml _manage_service _alpine_release_branch _alpine_current_repo_bases _alpine_candidate_repo_bases _alpine_write_repositories _alpine_prepare_repositories _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _get_total_mem_mb _count_active_proxy_nodes _count_runtime_heavy_items _detect_runtime_mode _get_runtime_profile_value _print_runtime_profile _apply_connectivity_first_optimizations _get_cloudflared_gomem_limit _apply_low_mem_optimizations _refresh_dynamic_runtime_limits _warn_lowmem_for_heavy_protocol _apply_single_protocol_network_tuning _alpine_bootstrap_before_init _install_cli_shortcut _ensure_cron_available
 
 export DEFAULT_SNI="$(_get_random_sni)"
 export MAIN_SCRIPT_PATH="${SELF_SCRIPT_PATH}"
 server_ip=""
 BATCH_MODE=false
-trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
+# 临时文件由各功能自行清理；禁止全局删除配置目录 *.tmp，以免影响并发写入。
 # 依赖安装
 _install_dependencies() {
     # 只安装缺失的核心依赖，避免每次进入菜单都触发 apk/apt 网络访问。
@@ -1402,10 +1397,11 @@ _install_sing_box() {
         return 1
     fi
     if [ -s "$CONFIG_FILE" ]; then
-        local candidate_config="${temp_dir}/config.dns-candidate.json"
-        _info "升级前预检：用候选核心检查迁移后的主配置和中转配置..."
-        if ! _build_dns_migration_candidate "$CONFIG_FILE" "$candidate_config" || \
-           ! _validate_singbox_config "$extracted_bin" "$candidate_config"; then
+        local candidate_dir="${temp_dir}/dns-preflight"
+        _info "升级前预检：按新核心版本构造主配置及中转配置候选..."
+        if ! _prepare_dns_bundle "$candidate_dir" "$extracted_bin" || \
+           ! _dns_check_graph "$candidate_dir/config.json" "$candidate_dir/relay.json" || \
+           ! _validate_singbox_config "$extracted_bin" "$candidate_dir/config.json" "$candidate_dir/relay.json"; then
             _error "新核心与现有配置不兼容，原核心和原配置未替换。临时目录：$temp_dir"
             return 1
         fi
@@ -1426,6 +1422,18 @@ _install_sing_box() {
             return 1
         fi
         _info "旧核心备份：$binary_backup"
+    fi
+    if [ -n "${candidate_dir:-}" ]; then
+        cmp -s "$CONFIG_FILE" "$candidate_dir/config.before.json" || {
+            _error "预检后主配置发生变化，取消核心替换。"; return 1;
+        }
+        if [ -f "$candidate_dir/has-relay" ]; then
+            cmp -s "${SINGBOX_DIR}/relay.json" "$candidate_dir/relay.before.json" || {
+                _error "预检后中转配置发生变化，取消核心替换。"; return 1;
+            }
+        elif [ -s "${SINGBOX_DIR}/relay.json" ]; then
+            _error "预检后新增了中转配置，取消核心替换。"; return 1
+        fi
     fi
     if ! mv -f "$extracted_bin" "$SINGBOX_BIN"; then
         _error "安装 sing-box 二进制文件失败: $SINGBOX_BIN"
@@ -2691,43 +2699,16 @@ _uninstall() {
 _initialize_config_files() {
     mkdir -p ${SINGBOX_DIR}
     if [ ! -s "$CONFIG_FILE" ]; then
-        # 使用 1.12+ 类型化本地 DNS，兼容 1.14；保留原模板的 IPv4-only 策略。
-        cat > "$CONFIG_FILE" << 'EOF'
-{
-  "ntp": {
-    "enabled": true,
-    "server": "time.apple.com",
-    "server_port": 123,
-    "interval": "30m"
-  },
-  "dns": {
-    "servers": [
-      {
-        "type": "local",
-        "tag": "dns-local"
-      }
-    ],
-    "rules": [],
-    "final": "dns-local",
-    "strategy": "ipv4_only"
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": [],
-    "final": "direct",
-    "default_domain_resolver": {
-      "server": "dns-local",
-      "strategy": "ipv4_only"
-    }
-  }
-}
-EOF
+        # 新装配置：版本感知的 local DNS；保留 IPv4-only 默认值。
+        local base_file new_file
+        base_file=$(mktemp "${CONFIG_FILE}.base.XXXXXX") || return 1
+        new_file=$(mktemp "${CONFIG_FILE}.new.XXXXXX") || { rm -f "$base_file"; return 1; }
+        printf '%s\n' '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}}' > "$base_file"
+        if ! _build_dns_migration_candidate "$base_file" "$new_file" "$SINGBOX_BIN" "${SINGBOX_DIR}/relay.json" main; then
+            rm -f "$base_file" "$new_file"; return 1
+        fi
+        rm -f "$base_file"
+        mv -f "$new_file" "$CONFIG_FILE" || { rm -f "$new_file"; return 1; }
     fi
     [ -s "$METADATA_FILE" ] || echo "{}" > "$METADATA_FILE"
     
@@ -2878,126 +2859,525 @@ _cleanup_legacy_config() {
     return 1
 }
 
-# DNS 迁移及校验（只处理本脚本已知的简单 local 模板；不重置自定义分流）。
-# 这些辅助函数不启动服务、不安装软件，也不改 /etc/resolv.conf。
-_validate_singbox_config() {
-    local bin="${1:-$SINGBOX_BIN}"
-    local cfg="${2:-$CONFIG_FILE}"
-    local relay="${3:-${SINGBOX_DIR}/relay.json}"
-    local result rc
-    local args=(check -c "$cfg")
-
-    if [ ! -x "$bin" ] || [ ! -s "$cfg" ]; then
-        _error "核心不可执行或主配置不存在：$bin / $cfg"
+# ============================================================
+# DNS 安全管理（参考 singbox-lite 的类型化 DNS/引导解析设计，重写迁移与事务）
+# 新配置要求 sing-box >=1.12；prefer_go 从 1.13 起启用；1.14 删除 independent_cache。
+# 不改 /etc/resolv.conf、时区、Clash IPv6 开关，不清空已有 DNS 分流。
+# ============================================================
+_sb_version_ge() {
+    local bin="$1" want_major="$2" want_minor="$3" text major minor
+    text=$("$bin" version 2>/dev/null) || return 1
+    if [[ "$text" =~ sing-box[[:space:]]version[[:space:]]v?([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
+        major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]}))
+        ((major > want_major || (major == want_major && minor >= want_minor)))
+    else
         return 1
     fi
-    # 与 systemd / OpenRC 的实际启动参数一致，避免漏查中转配置。
-    [ -s "$relay" ] && args+=(-c "$relay")
-    result=$(_with_timeout_label "${SB_CONFIG_CHECK_TIMEOUT:-30}" "检查 sing-box 合并配置" "$bin" "${args[@]}" 2>&1)
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        _error "配置校验失败；不会继续本次启动或核心替换。"
-        printf '%s\n' "$result" >&2
-        return "$rc"
-    fi
-    # 也显示成功校验时的弃用警告，不再把警告静默吞掉。
-    [ -z "$result" ] || printf '%s\n' "$result" >&2
-    return 0
+}
+
+_dns_jq_program() {
+    cat <<'XLDJ_DNS_JQ'
+# 地址转换仅覆盖无歧义的 local/UDP/TCP/DoT/DoH；不猜测 FakeIP/RCode 等语义。
+def nonempty: type == "string" and length > 0;
+def resolver_tag: if type == "string" then . else .server // "" end;
+def ipv4:
+  test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$") and
+  (split(".") | all(.[]; (length <= 3) and (tonumber <= 255)));
+def ipv6:
+  split("%") as $z | $z[0] as $h |
+  ($z | length) <= 2 and
+  (if ($z | length) == 2 then ($z[1] | test("^[A-Za-z0-9_.-]+$")) else true end) and
+  ($h | contains(":")) and ($h | contains(":::") | not) and
+  (($h | split("::") | length) <= 2) and
+  (($h | startswith(":") | not) or ($h | startswith("::"))) and
+  (($h | endswith(":") | not) or ($h | endswith("::"))) and
+  ([$h | split(":")[] | select(. != "")] as $parts |
+    all($parts | to_entries[];
+      if (.value | contains(".")) then (.key == ($parts | length) - 1) and (.value | ipv4)
+      else (.value | test("^[0-9A-Fa-f]{1,4}$")) end) and
+    ([$parts[] | if contains(".") then 2 else 1 end] | add // 0) as $count |
+    if ($h | contains("::")) then $count < 8 else $count == 8 end);
+def ip_literal: ipv4 or ipv6;
+def capture_one($re):
+  [capture($re)] | if length == 1 then .[0] else error("DNS 地址格式不合法") end;
+def endpoint:
+  . as $address |
+  if (type != "string") or (length == 0) or test("[\\s\\x00-\\x1f@#]") then
+    error("DNS 地址为空或含空白、认证信息、片段标识")
+  elif . == "local" then {type:"local"}
+  else
+    (if contains("://") then capture_one("^(?<scheme>[A-Za-z0-9]+)://(?<rest>.+)$")
+     else {scheme:"udp",rest:.} end) as $u |
+    ($u.scheme | ascii_downcase) as $scheme |
+    if (["udp","tcp","tls","https"] | index($scheme)) == null then
+      error("不自动转换此 DNS 协议：" + $scheme)
+    else
+      ($u.rest | split("/")[0]) as $authority |
+      ($u.rest | ltrimstr($authority)) as $path |
+      if ($scheme != "https" and $path != "") or ($authority | contains("?")) then
+        error("DNS 地址路径不合法；DoH 查询参数必须放在 / 路径后")
+      else
+        (if ($authority | startswith("[")) then
+           ($authority | capture_one("^\\[(?<host>[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?)\\](?::(?<port>[0-9]+))?$"))
+         elif ($authority | [scan(":")] | length) > 1 then
+           if ($address | contains("://")) then error("URL 中的 IPv6 地址必须使用 [IPv6] 格式")
+           else {host:$authority} end
+         else ($authority | capture_one("^(?<host>[^:]+)(?::(?<port>[0-9]+))?$")) end) as $hp |
+        if (($authority | startswith("[")) and ($hp.host | ipv6 | not)) or
+           (($hp.host | contains(":")) and ($hp.host | ipv6 | not)) or
+           (($hp.host | test("^[0-9.]+$")) and ($hp.host | ipv4 | not)) or
+           ($hp.host | length) == 0 or
+           (($hp.host | ip_literal | not) and
+            (($hp.host | length) > 253 or ($hp.host | test("^[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_.])?$" ) | not))) then
+          error("DNS 主机名格式不合法")
+        else
+          (($hp.port // (if $scheme == "tls" then "853" elif $scheme == "https" then "443" else "53" end)) | tonumber) as $port |
+          if $port < 1 or $port > 65535 then error("DNS 端口必须为 1-65535")
+          else {type:$scheme, server:$hp.host, server_port:$port}
+            + (if $scheme == "https" then {path:(if $path == "" then "/dns-query" else $path end)} else {} end)
+          end
+        end
+      end
+    end
+  end;
+def local_options:
+  if .type == "local" and $prefer_go and (has("prefer_go") | not) then .prefer_go = true else . end;
+def ensure_resolver($wanted; $other):
+  (.route.default_domain_resolver // $other.route.default_domain_resolver) as $existing |
+  if $existing == null then .route.default_domain_resolver = $wanted
+  elif ($existing | resolver_tag) != ($wanted | resolver_tag) then
+    error("旧 outbound DNS 规则与现有 default_domain_resolver 冲突，拒绝自动覆盖")
+  elif (($wanted | keys) - ["server","strategy"] | length) > 0 and $existing != $wanted then
+    error("旧 DNS 规则附加解析选项与现有默认解析器不一致，请手动迁移")
+  elif ($existing | type) == "object" and $existing.strategy != null and $wanted.strategy != null and $existing.strategy != $wanted.strategy then
+    error("旧 DNS 规则的解析策略与现有默认解析器冲突")
+  else . end;
+def convert_server($root; $other):
+  . as $old |
+  if type != "object" then error("DNS server 必须是对象")
+  elif (.type // "") != "" then
+    if has("address") then error("单个 DNS 服务器同时含 type/address，拒绝猜测") else local_options end
+  else
+    if ((keys - ["tag","address","address_resolver","address_strategy","detour"]) | length) != 0 then
+      error("旧 DNS 服务器 " + (.tag // "<未命名>") + " 含策略/ECS或其他高级字段，需按官方迁移指南处理")
+    else
+      (.address | endpoint) as $base |
+      (($root.outbounds // []) + ($other.outbounds // [])) as $outs |
+      ($old.detour // "") as $specified |
+      (if $specified != "" then $specified
+       elif ($root.route.final // $other.route.final // "") != "" then ($root.route.final // $other.route.final)
+       elif ($outs | length) == 1 then ($outs[0].tag // "")
+       elif ($outs | length) == 0 then ""
+       else error("旧 DNS 使用隐式默认出站且有多个出站，无法无损推断 detour") end) as $detour |
+      ([$outs[] | select(.tag == $detour)]) as $matched |
+      # 只省略真正空白的 direct，带 bind_interface/路由选项的 direct 保留。
+      (if $detour == "" or ($matched | length == 1 and .[0].type == "direct" and ((.[0] | keys) - ["type","tag"] | length == 0))
+       then {} else {detour:$detour} end) as $dial |
+      if ($base.server // "" | length) > 0 and ($base.server | ip_literal | not) and ($old.address_resolver // "") == "" then
+        error("旧 DNS 域名上游缺 address_resolver，拒绝猜测引导解析器")
+      elif $base.type == "local" and (($old.address_resolver // "") != "" or ($old.address_strategy // "") != "") then
+        error("旧 local DNS 含额外引导解析设置，请手动确认")
+      else
+        $base + (if $old | has("tag") then {tag:$old.tag} else {} end) + $dial |
+        if ($old.address_resolver // "") != "" then
+          .domain_resolver = ({server:$old.address_resolver} +
+            (if ($old.address_strategy // $root.dns.strategy // $other.dns.strategy // "") != ""
+             then {strategy:($old.address_strategy // $root.dns.strategy // $other.dns.strategy)} else {} end))
+        else . end | local_options
+      end
+    end
+  end;
+def migrate($other):
+  . as $root |
+  if .dns != null and (.dns | type) != "object" then error("dns 必须是对象") else . end |
+  if .dns == null and $role == "main" and (($other.dns.servers // []) | length) == 0 then
+    .dns = {servers:[({type:"local",tag:"dns-local"} | local_options)],rules:[],final:"dns-local",strategy:"ipv4_only"} |
+    ensure_resolver({server:"dns-local",strategy:"ipv4_only"}; $other)
+  elif .dns != null then
+    if (.dns | has("servers")) then
+      if (.dns.servers | type) != "array" then error("dns.servers 必须是数组")
+      else .dns.servers |= map(convert_server($root; $other)) end
+    else . end |
+    # 仅迁移位于最前面的无条件 outbound:any，其他条件/逻辑规则保留并拒绝猜测。
+    ([.dns.rules[]? | .. | objects | select(has("outbound"))]) as $old_rules |
+    if ($old_rules | length) > 0 then
+      if ($old_rules | length) != 1 or (.dns.rules[0].outbound != "any" and .dns.rules[0].outbound != ["any"]) or
+         ((.dns.rules[0] | keys) - ["outbound","server","strategy","disable_cache","rewrite_ttl","client_subnet","action"] | length) != 0 or
+         (.dns.rules[0].action // "route") != "route" or
+         ((.dns.rules[0].server | nonempty) | not) or
+         (($other.dns.rules // []) | length) > 0 then
+        error("含复杂/有顺序依赖的旧 outbound DNS 规则；原配置保持不变")
+      else
+        (.dns.rules[0] | del(.outbound,.action) |
+          if has("strategy") then .
+          elif ($root.dns.strategy // $other.dns.strategy // "") != "" then .strategy = ($root.dns.strategy // $other.dns.strategy)
+          else . end) as $wanted |
+        ensure_resolver($wanted; $other) | .dns.rules = .dns.rules[1:]
+      end
+    else . end |
+    # 只补本脚本的单 local 模板，不为自定义多 DNS 擅自指定默认解析器。
+    if (.dns.servers | length) == 1 and .dns.servers[0].tag == "dns-local" and .dns.servers[0].type == "local" and
+       ((.dns.servers[0] | keys) - ["type","tag","prefer_go"] | length) == 0 and ((.dns.rules // []) | length) == 0 and
+       (($other.dns.servers // []) | length) == 0 then
+      .dns.strategy //= "ipv4_only" |
+      .dns.final //= "dns-local" |
+      if .route.default_domain_resolver == null and $other.route.default_domain_resolver == null then
+        .route.default_domain_resolver = {server:"dns-local",strategy:.dns.strategy}
+      else . end
+    else . end |
+    if $modern_cache then del(.dns.independent_cache) else . end
+  else . end |
+  # 内置 NTP 只作程序内部补偿，不把缺失字段理解为已同步成功。
+  if $role == "main" and .ntp == null and $other.ntp == null then
+    .ntp = {enabled:true,server:"time.apple.com",server_port:123,interval:"30m",write_to_system:false}
+  elif $container and (.ntp | type) == "object" and .ntp.write_to_system == true then
+    .ntp.write_to_system = false
+  else . end;
+if $op == "endpoint" then $address | endpoint | local_options
+elif $op == "migrate" then migrate($other[0] // {})
+else error("未知 DNS 转换动作") end
+XLDJ_DNS_JQ
 }
 
 _build_dns_migration_candidate() {
-    local src="$1" dst="$2"
-    local relay="${SINGBOX_DIR}/relay.json"
-    local relay_has_dns=false
-
-    command -v jq >/dev/null 2>&1 || { _error "缺少 jq，无法安全迁移 DNS。"; return 1; }
-    # 拒绝损坏 JSON 或多个顶层文档，不能用默认模板掩盖原始错误。
+    local src="$1" dst="$2" bin="${3:-$SINGBOX_BIN}"
+    local other="${4:-${SINGBOX_DIR}/relay.json}" role="${5:-main}"
+    local prefer_go=false modern_cache=false is_container=false
+    command -v jq >/dev/null 2>&1 || { _error "缺少 jq。"; return 1; }
+    _sb_version_ge "$bin" 1 12 || { _error "DNS 管理要求 sing-box 1.12+，或核心版本无法识别。"; return 1; }
     jq -e -s 'length == 1 and (.[0] | type == "object")' "$src" >/dev/null 2>&1 || {
-        _error "主配置不是有效的单个 JSON 对象，保留原文件：$src"
-        return 1
+        _error "配置不是单个有效 JSON 对象：$src"; return 1;
     }
-    if [ -s "$relay" ] && jq -e '(.dns.servers // []) | length > 0' "$relay" >/dev/null 2>&1; then
-        relay_has_dns=true
-    fi
-
-    jq --argjson relay_has_dns "$relay_has_dns" '
-      def old_default_local:
-        (.dns | type == "object") and
-        (.dns.servers | type == "array" and length == 1) and
-        (.dns.servers[0] | (
-          . == {"tag":"dns-local","address":"local","detour":"direct"} or
-          . == {"tag":"dns-local","address":"local"}
-        )) and
-        ((.dns.rules // []) == [] or
-         (.dns.rules == [{"outbound":"any","server":"dns-local"}]));
-
-      if ((.dns == null) and ($relay_has_dns | not)) then
-        .dns = {
-          "servers":[{"type":"local","tag":"dns-local"}],
-          "rules":[], "final":"dns-local", "strategy":"ipv4_only"
-        } |
-        .route.default_domain_resolver //= {"server":"dns-local","strategy":"ipv4_only"}
-      elif old_default_local then
-        # 只换已识别的旧模板：不动入站、出站、现有路由规则或已有解析器设置。
-        .dns.servers[0] = {"type":"local","tag":"dns-local"} |
-        .dns.rules = [] |
-        .dns.final //= "dns-local" |
-        .dns.strategy //= "ipv4_only" |
-        .route.default_domain_resolver //= {"server":"dns-local","strategy":.dns.strategy} |
-        (if .dns.independent_cache == false then del(.dns.independent_cache) else . end)
-      else
-        # 自定义 DNS / 已迁移的新配置不强制覆盖；其兼容性由核心 check 判断。
-        .
-      end
-    ' "$src" > "$dst"
+    if [ -s "$other" ]; then
+        jq -e -s 'length == 1 and (.[0] | type == "object")' "$other" >/dev/null 2>&1 || {
+            _error "中转/关联配置不是单个有效 JSON 对象：$other"; return 1;
+        }
+    else other=/dev/null; fi
+    _sb_version_ge "$bin" 1 13 && prefer_go=true
+    _sb_version_ge "$bin" 1 14 && modern_cache=true
+    _is_container_environment && is_container=true
+    jq -e --arg op migrate --arg address "" --arg role "$role" \
+        --argjson prefer_go "$prefer_go" --argjson modern_cache "$modern_cache" \
+        --argjson container "$is_container" --slurpfile other "$other" \
+        "$(_dns_jq_program)" "$src" > "$dst"
 }
 
-_check_and_fix_dns() {
-    # 返回值：0=已迁移，1=无需修改，2=迁移或校验失败。
-    # 仅在候选配置通过“主配置 + relay.json”校验后备份并原子替换。
-    [ -s "$CONFIG_FILE" ] || return 1
-    local tmp_file backup stamp
-    tmp_file=$(mktemp "${CONFIG_FILE}.dns-migrate.XXXXXX") || {
-        _error "无法创建 DNS 迁移临时文件。"
-        return 2
-    }
-    if ! _build_dns_migration_candidate "$CONFIG_FILE" "$tmp_file"; then
-        rm -f "$tmp_file"
-        return 2
-    fi
-    if jq -e -s '.[0] == .[1]' "$CONFIG_FILE" "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file"
-        return 1
-    fi
+_dns_endpoint_json() {
+    local address="$1" bin="${2:-$SINGBOX_BIN}" prefer_go=false
+    _sb_version_ge "$bin" 1 13 && prefer_go=true
+    jq -en --arg op endpoint --arg address "$address" --arg role main \
+        --argjson prefer_go "$prefer_go" --argjson modern_cache false \
+        --argjson container false --slurpfile other /dev/null "$(_dns_jq_program)"
+}
 
-    _info "检测到旧版默认 DNS 模板，正在迁移至 type=local / default_domain_resolver..."
-    if ! _validate_singbox_config "$SINGBOX_BIN" "$tmp_file"; then
-        _error "DNS 迁移未应用，原配置保持不变。新 DNS 格式要求 sing-box 1.12+。"
-        rm -f "$tmp_file"
-        return 2
+# 生成两个独立候选文件；升级预检也必须传入“新核心”，不能按旧核心版本构造。
+_prepare_dns_bundle() {
+    local dir="$1" bin="${2:-$SINGBOX_BIN}" relay="${SINGBOX_DIR}/relay.json"
+    mkdir -p "$dir" || return 1
+    [ -s "$CONFIG_FILE" ] || { _error "主配置不存在或为空：$CONFIG_FILE"; return 1; }
+    # 拒绝写穿符号链接；自定义配置布局应先人工确认。
+    [ ! -L "$CONFIG_FILE" ] && [ ! -L "$relay" ] || { _error "配置是符号链接，拒绝自动覆盖。"; return 1; }
+    cp -p "$CONFIG_FILE" "$dir/config.before.json" || return 1
+    if [ -s "$relay" ]; then
+        cp -p "$relay" "$dir/relay.before.json" || return 1
+        : > "$dir/has-relay"
+    else
+        printf '{}\n' > "$dir/relay.before.json" || return 1
+        rm -f "$dir/has-relay"
     fi
+    _build_dns_migration_candidate "$dir/config.before.json" "$dir/config.json" "$bin" "$dir/relay.before.json" main || return 1
+    _build_dns_migration_candidate "$dir/relay.before.json" "$dir/relay.json" "$bin" "$dir/config.before.json" fragment || return 1
+}
 
-    stamp=$(date +%Y%m%d-%H%M%S)
-    backup=$(mktemp "${CONFIG_FILE}.bak.dns-${stamp}.XXXXXX") || {
-        rm -f "$tmp_file"
-        _error "无法创建配置备份，取消迁移。"
-        return 2
-    }
-    if ! cp -p "$CONFIG_FILE" "$backup"; then
-        rm -f "$tmp_file" "$backup"
-        _error "备份配置失败，取消迁移。"
-        return 2
+# 额外检查 DNS tag/引导解析循环；此检查不能验证上游网络是否可达。
+_dns_check_graph() {
+    local cfg="$1" relay="$2"
+    jq -es '
+      def rt: if type == "string" then . else .server // "" end;
+      [.[].dns.servers[]?] as $s |
+      [$s[] | .tag // "" | select(. != "")] as $tags |
+      if ($tags | unique | length) != ($tags | length) then error("主配置与中转配置存在重复 DNS tag")
+      else
+        (reduce $s[] as $x ({}; if ($x.tag // "") != "" then .[$x.tag] = ($x.domain_resolver // "" | rt) else . end)) as $edges |
+        def visit($t; $seen):
+          if $t == "" then true
+          elif ($seen | index($t)) != null then error("DNS 引导解析形成循环：" + $t)
+          elif ($edges | has($t) | not) then error("DNS 引导解析引用不存在：" + $t)
+          else visit($edges[$t]; $seen + [$t]) end;
+        all($tags[]; visit(.; []))
+      end
+    ' "$cfg" "$relay" >/dev/null
+}
+
+_validate_singbox_config() {
+    local bin="${1:-$SINGBOX_BIN}" cfg="${2:-$CONFIG_FILE}" relay="${3-${SINGBOX_DIR}/relay.json}"
+    local result rc args=(check -c "$cfg")
+    [ -x "$bin" ] && [ -s "$cfg" ] || { _error "核心不可执行或主配置不存在。"; return 1; }
+    [ -s "$relay" ] && args+=(-c "$relay")
+    result=$(_with_timeout_label "${SB_CONFIG_CHECK_TIMEOUT:-30}" "检查 sing-box 合并配置" "$bin" "${args[@]}" 2>&1)
+    rc=$?
+    [ -z "$result" ] || printf '%s\n' "$result" >&2
+    if [ "$rc" -ne 0 ]; then
+        _error "合并配置校验失败，未发出本次服务重启命令。"
+        return "$rc"
     fi
-    if ! mv -f "$tmp_file" "$CONFIG_FILE"; then
-        rm -f "$tmp_file"
-        _error "写入迁移配置失败；备份位于：$backup"
-        return 2
-    fi
-    _success "DNS 已迁移；保留现有节点、分流和 IPv4 策略。备份：$backup"
     return 0
 }
 
-export -f _validate_singbox_config _build_dns_migration_candidate _check_and_fix_dns
+# 手动设置只替换选中的服务器，并保留 tag/分流/其他服务器；复杂传输字段拒绝猜测。
+_dns_set_candidate() {
+    local cfg="$1" relay="$2" address="$3" strategy="${4:-keep}" bootstrap="${5:-local}" tag="${6:-}"
+    local server boot='null' host boot_tag candidate
+    case "$strategy" in keep|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;; *) _error "无效 DNS 策略。"; return 1 ;; esac
+    if [ -z "$tag" ]; then
+        tag=$(jq -r '.dns.final // (.route.default_domain_resolver | if type == "string" then . else .server end) // .dns.servers[0].tag // "dns-local"' "$cfg") || return 1
+    fi
+    [[ "$tag" =~ ^[A-Za-z0-9_.-]+$ ]] && [ "${#tag}" -le 128 ] || { _error "DNS tag 只允许字母、数字、点、横线、下划线（最长128字符）。"; return 1; }
+    jq -e --arg tag "$tag" 'any(.dns.servers[]?; .tag == $tag)' "$relay" >/dev/null 2>&1 && {
+        _error "目标 DNS 位于 relay.json；为避免跨配置改写，请在该文件手动管理。"; return 1;
+    }
+    jq -e --arg tag "$tag" '
+      all(.dns.servers[]? | select(.tag == $tag);
+        ((keys - ["type","tag","server","server_port","path","domain_resolver","prefer_go"]) | length) == 0)
+    ' "$cfg" >/dev/null || { _error "目标 DNS 有自定义 TLS/拨号/高级选项，拒绝覆盖；请手动编辑。"; return 1; }
+    server=$(_dns_endpoint_json "$address") || return 1
+    host=$(jq -r '.server // ""' <<< "$server") || return 1
+    # 域名上游必须有独立 bootstrap；bootstrap 只允许 local 或 IP，避免再次依赖目标 DNS。
+    if [ -n "$host" ] && [[ "$host" != *:* ]] && [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        boot=$(_dns_endpoint_json "$bootstrap") || return 1
+        jq -e '.type == "local" or ((.type == "udp" or .type == "tcp") and (.server | contains(":") or test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")))' <<< "$boot" >/dev/null || {
+            _error "引导 DNS 只能使用 local、IP、udp://IP 或 tcp://IP。"; return 1;
+        }
+        boot_tag="xldj-bootstrap-${tag}"
+        local n=0 existing
+        while true; do
+            candidate="$boot_tag"; [ "$n" -gt 0 ] && candidate="${boot_tag}-${n}"
+            existing=$(jq -cs --arg tag "$candidate" '[.[].dns.servers[]? | select(.tag == $tag)]' "$cfg" "$relay") || return 1
+            if [ "$existing" = '[]' ] || jq -e --argjson boot "$boot" 'length == 1 and (.[0] | del(.tag)) == $boot' <<< "$existing" >/dev/null; then
+                boot_tag="$candidate"; break
+            fi
+            n=$((n + 1)); [ "$n" -le 100 ] || { _error "无法分配唯一 bootstrap tag。"; return 1; }
+        done
+        local resolver_strategy="$strategy"
+        if [ "$resolver_strategy" = keep ]; then
+            resolver_strategy=$(jq -r '.dns.strategy // empty' "$cfg") || return 1
+        fi
+        server=$(jq --arg tag "$boot_tag" --arg strategy "$resolver_strategy" '
+          .domain_resolver = ({server:$tag} + (if $strategy != "" then {strategy:$strategy} else {} end))
+        ' <<< "$server") || return 1
+        boot=$(jq --arg tag "$boot_tag" '.tag = $tag' <<< "$boot") || return 1
+    fi
+    local tmp="${cfg}.set"
+    if ! jq -e --arg tag "$tag" --arg strategy "$strategy" --argjson server "$server" --argjson boot "$boot" \
+        --slurpfile relay "$relay" '
+      .dns //= {} | .dns.servers //= [] |
+      ([.dns.servers[] | select(.tag == $tag)] | length) as $n |
+      if $n > 1 then error("重复 DNS tag")
+      elif $n == 1 then .dns.servers |= map(if .tag == $tag then $server + {tag:$tag} else . end)
+      elif (.dns.servers | length) == 0 and ([$relay[].dns.servers[]?] | length) == 0 then
+        .dns.servers = [$server + {tag:$tag}] | .dns.final = $tag |
+        .route.default_domain_resolver //= {server:$tag}
+      else error("指定 tag 不在主配置中；不会新增并擅自接管现有默认 DNS") end |
+      if $boot != null and ([.dns.servers[], $relay[].dns.servers[]?] | any(.tag == $boot.tag) | not) then
+        .dns.servers += [$boot]
+      else . end |
+      if $strategy != "keep" then
+        .dns.strategy = $strategy |
+        if (.route.default_domain_resolver | type) == "string" and .route.default_domain_resolver == $tag then
+          .route.default_domain_resolver = {server:$tag,strategy:$strategy}
+        elif (.route.default_domain_resolver | type) == "object" and .route.default_domain_resolver.server == $tag then
+          .route.default_domain_resolver.strategy = $strategy
+        else . end
+      else . end
+    ' "$cfg" > "$tmp"; then rm -f "$tmp"; return 1; fi
+    mv -f "$tmp" "$cfg"
+}
+
+_service_is_active() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
+        openrc) rc-service sing-box status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+_service_action_raw() {
+    local action="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            if [ "$action" = "status" ]; then systemctl status sing-box --no-pager -l; return; fi
+            _with_timeout 30 systemctl "$action" sing-box || return $? ;;
+        openrc)
+            if [ "$action" = "status" ]; then rc-service sing-box status; return; fi
+            _with_timeout 30 rc-service sing-box "$action" || return $? ;;
+        *) _error "不支持的服务管理系统。"; return 1 ;;
+    esac
+    if [[ "$action" == "start" || "$action" == "restart" ]]; then
+        sleep 1
+        _service_is_active || { _error "启动命令返回后服务未保持运行，请看日志。"; return 1; }
+    fi
+    return 0
+}
+
+# 返回：0=已应用/明确启动成功；1=auto 模式无改动；2=失败。
+# 目录锁不增加 flock 依赖；kill -9/断电无法运行 trap，残留锁须人工确认后清理。
+_dns_transaction() (
+    local mode="${1:-fix}" address="${2:-}" strategy="${3:-keep}" bootstrap="${4:-local}" tag="${5:-}"
+    local lock="${SINGBOX_DIR}/.xldj-dns.lock" dir='' backup='' i changed=false active=false
+    local main_changed=false relay_changed=false committed_main=false committed_relay=false finished=false
+    local relay="${SINGBOX_DIR}/relay.json"
+    _check_root
+    [ -s "$CONFIG_FILE" ] || { _error "主配置不存在或为空。"; exit 2; }
+    command -v jq >/dev/null 2>&1 || { _error "缺少 jq。"; exit 2; }
+    case "$mode" in auto|fix|start|restart|set|preview) ;; *) _error "未知 DNS 操作。"; exit 2 ;; esac
+    for ((i=0; i<50; i++)); do
+        mkdir -m 700 "$lock" 2>/dev/null && break
+        sleep 0.1
+    done
+    if [ "$i" -ge 50 ]; then
+        _error "DNS 操作锁被占用：$lock；若之前异常终止，请先确认无脚本运行再清理。"
+        exit 2
+    fi
+    printf '%s\n' "$BASHPID" > "$lock/pid"
+    # 中断时只恢复本事务写入的文件，不覆盖外部程序在此后写入的新内容。
+    _dns_tx_cleanup() {
+        if [ "$finished" != true ] && [ -n "$backup" ]; then
+            if [ "$committed_main" = true ]; then
+                if cmp -s "$CONFIG_FILE" "$dir/config.applied.json"; then
+                    cp -p "$backup/config.json" "$dir/config.restore" && mv -f "$dir/config.restore" "$CONFIG_FILE" || _error "主配置回滚失败，备份：$backup"
+                else _error "主配置被其他程序修改，未强行覆盖；备份：$backup"; fi
+            fi
+            if [ "$committed_relay" = true ]; then
+                if cmp -s "$relay" "$dir/relay.applied.json"; then
+                    cp -p "$backup/relay.json" "$dir/relay.restore" && mv -f "$dir/relay.restore" "$relay" || _error "中转配置回滚失败，备份：$backup"
+                else _error "中转配置被其他程序修改，未强行覆盖；备份：$backup"; fi
+            fi
+        fi
+        [ -z "$dir" ] || rm -rf -- "$dir"
+        rm -f -- "$lock/pid"; rmdir "$lock" 2>/dev/null || true
+    }
+    trap _dns_tx_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    dir=$(mktemp -d "${SINGBOX_DIR}/.dns-tx.XXXXXX") || exit 2
+    _prepare_dns_bundle "$dir" "$SINGBOX_BIN" || exit 2
+    if [ "$mode" = set ]; then
+        _dns_set_candidate "$dir/config.json" "$dir/relay.json" "$address" "$strategy" "$bootstrap" "$tag" || exit 2
+    fi
+    _dns_check_graph "$dir/config.json" "$dir/relay.json" || exit 2
+    _validate_singbox_config "$SINGBOX_BIN" "$dir/config.json" "$dir/relay.json" || exit 2
+    jq -es '.[0] == .[1]' "$dir/config.before.json" "$dir/config.json" >/dev/null || main_changed=true
+    jq -es '.[0] == .[1]' "$dir/relay.before.json" "$dir/relay.json" >/dev/null || relay_changed=true
+    if [ "$main_changed" = true ] || [ "$relay_changed" = true ]; then changed=true; fi
+    if [ "$mode" = preview ]; then
+        _info "DNS/NTP 迁移预检通过；需修改：$changed。未替换配置，未重启服务。"
+        # 只展示 DNS/NTP 相关字段，避免输出节点私钥、密码和完整入站配置。
+        for i in config relay; do
+            printf '\n--- %s.json 候选 DNS/NTP ---\n' "$i"
+            jq '{dns, default_domain_resolver:.route.default_domain_resolver, ntp}' "$dir/${i}.json"
+        done
+        finished=true; exit 0
+    fi
+    if [ "$changed" = false ] && [ "$mode" != start ] && [ "$mode" != restart ]; then
+        _success "DNS 配置无需修改；没有备份、覆盖或重启。"
+        finished=true
+        [ "$mode" = auto ] && exit 1
+        exit 0
+    fi
+    [ -n "$INIT_SYSTEM" ] || _detect_init_system
+    _service_is_active && active=true
+    if [ "$mode" != auto ] || [ "$active" = true ]; then
+        case "$INIT_SYSTEM" in systemd|openrc) ;; *) _error "没有可用服务管理器，未应用配置。"; exit 2 ;; esac
+    fi
+    # CAS 检查：候选生成后若原配置变化，停止而不是覆盖对方写入。
+    cmp -s "$CONFIG_FILE" "$dir/config.before.json" || { _error "主配置已变化，取消本次修改。"; exit 2; }
+    if [ -f "$dir/has-relay" ]; then
+        cmp -s "$relay" "$dir/relay.before.json" || { _error "中转配置已变化，取消本次修改。"; exit 2; }
+    elif [ -s "$relay" ]; then _error "中转配置刚被创建，取消本次修改。"; exit 2; fi
+    if [ "$changed" = true ]; then
+        backup=$(mktemp -d "${SINGBOX_DIR}/dns-backup-$(date +%Y%m%d-%H%M%S).XXXXXX") || exit 2
+        cp -p "$dir/config.before.json" "$backup/config.json" || exit 2
+        [ ! -f "$dir/has-relay" ] || cp -p "$dir/relay.before.json" "$backup/relay.json" || exit 2
+        printf 'script=%s\nmode=%s\n' "$SCRIPT_VERSION" "$mode" > "$backup/README"
+        cp -p "$dir/config.json" "$dir/config.applied.json" || exit 2
+        cp -p "$dir/relay.json" "$dir/relay.applied.json" || exit 2
+        if [ "$main_changed" = true ]; then
+            # 权限沿用原配置（新建文件仍受 umask 077 保护）。
+            chmod --reference="$CONFIG_FILE" "$dir/config.json" 2>/dev/null || chmod 600 "$dir/config.json" || exit 2
+            mv -f "$dir/config.json" "$CONFIG_FILE" || exit 2; committed_main=true
+        fi
+        if [ "$relay_changed" = true ]; then
+            chmod --reference="$relay" "$dir/relay.json" 2>/dev/null || chmod 600 "$dir/relay.json" || exit 2
+            mv -f "$dir/relay.json" "$relay" || exit 2; committed_relay=true
+        fi
+        _info "配置备份：$backup"
+    fi
+    if [ "$mode" != auto ] || [ "$active" = true ]; then
+        # 只刷新服务资源限制，禁止该步骤再次重写刚校验过的 DNS/log JSON。
+        SB_PRESERVE_RUNTIME_CONFIG=1 _refresh_dynamic_runtime_limits sing-box 2>/dev/null || true
+        local action=restart
+        [ "$mode" = start ] && action=start
+        if ! _service_action_raw "$action"; then
+            _error "服务启动失败，正在恢复本次修改前的配置；不是已成功修复。"
+            _dns_tx_cleanup
+            # 清理已完成，避免 EXIT 再回滚；旧配置可能本来就与当前核心不兼容。
+            finished=true; dir=''; backup=''
+            trap - EXIT
+            if [ "$active" = true ] && _validate_singbox_config; then
+                _service_action_raw restart || _error "旧配置也未能恢复运行，请检查日志。"
+            fi
+            exit 2
+        fi
+        _success "服务已启动并通过即时状态检查；上游 DNS 连通性仍以实际请求和日志为准。"
+    else
+        _info "配置已迁移；原服务未运行，未自动启动。"
+    fi
+    finished=true
+    exit 0
+)
+
+_check_and_fix_dns() { _dns_transaction auto; }
+_dns_status() {
+    local file
+    "$SINGBOX_BIN" version 2>/dev/null | head -n 1
+    for file in "$CONFIG_FILE" "${SINGBOX_DIR}/relay.json"; do
+        [ -s "$file" ] || continue
+        printf '\n--- %s ---\n' "$file"
+        jq '{dns, default_domain_resolver:.route.default_domain_resolver, ntp}' "$file" || return 1
+    done
+    _info "local/引导 DNS 依赖本机解析；配置检查通过不等于网络可达。"
+    _info "没有修改 /etc/resolv.conf、Clash IPv6、时区或系统时钟。"
+}
+_dns_menu() {
+    local choice address tag strategy bootstrap
+    while true; do
+        echo ""
+        echo "===== DNS 管理（只管理 sing-box 服务端）====="
+        echo " 1) 查看 DNS/NTP 配置    2) 迁移预检（不改配置）"
+        echo " 3) 应用安全迁移        4) 修改指定 DNS 上游"
+        echo " 0) 返回"
+        read -r -p "请选择 [0-4]: " choice || return
+        case "$choice" in
+            1) _dns_status ;;
+            2) _dns_transaction preview ;;
+            3) _dns_transaction fix ;;
+            4)
+                _info "只替换指定 tag 的上游；保留分流、其他 DNS 及默认解析器引用。应用时可能重启服务。"
+                read -r -p "DNS tag（回车选择主配置默认 DNS）: " tag || return
+                read -r -p "上游（local / IP / udp://IP / tcp://IP / tls://域名 / https://域名/dns-query）: " address || return
+                [ -n "$address" ] || { _error "地址不能为空。"; continue; }
+                read -r -p "策略（回车保留；ipv4_only/prefer_ipv4/ipv6_only/prefer_ipv6）: " strategy || return
+                read -r -p "域名上游的引导 DNS（回车 local；也可 IP 或 tcp://IP）: " bootstrap || return
+                _dns_transaction set "$address" "${strategy:-keep}" "${bootstrap:-local}" "$tag"
+                ;;
+            0) return ;;
+            *) _error "无效选项。" ;;
+        esac
+    done
+}
+export -f _sb_version_ge _dns_jq_program _build_dns_migration_candidate _dns_endpoint_json \
+    _prepare_dns_bundle _dns_check_graph _validate_singbox_config _dns_set_candidate \
+    _service_is_active _service_action_raw _dns_transaction _check_and_fix_dns _dns_status _dns_menu
+
 
 _generate_self_signed_cert() {
     local domain="$1"
@@ -5142,7 +5522,7 @@ _do_update_singbox() {
         # 确保配置文件存在
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
             _info "检测到主配置文件缺失，正在初始化..."
-            _initialize_config_files
+            _initialize_config_files || return 1
         fi
         _init_relay_config
         if [ ! -s "${SINGBOX_DIR}/relay.json" ]; then
@@ -5748,12 +6128,13 @@ _main_menu() {
         echo -e "    ${GREEN}[6]${NC} 重启服务          ${GREEN}[7]${NC} 停止服务"
         echo -e "    ${GREEN}[8]${NC} 查看运行状态      ${GREEN}[9]${NC} 查看实时日志"
         echo -e "    ${GREEN}[10]${NC} 定时重启设置"
-        echo -e "    ${GREEN}[11]${NC} 同步系统时间"
+        echo -e "    ${GREEN}[11]${NC} 时间检查（容器跳过系统校时）"
         echo ""
         
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
         echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
+        echo -e "    ${GREEN}[19]${NC} DNS 管理 / 安全迁移 / 自定义上游"
         echo ""
         
         # 核心管理
@@ -5774,7 +6155,7 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-18]: " choice
+        read -p "  请输入选项 [0-19]: " choice
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -5795,6 +6176,7 @@ _main_menu() {
             16) _uninstall ;; 
             17) _require_singbox && _advanced_features ;;
             18) _xray_features ;;
+            19) _require_singbox && _dns_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -6241,32 +6623,21 @@ main() {
         # 3. 检查配置文件
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
              _info "检测到主配置文件缺失，正在初始化..."
-             _initialize_config_files
+             _initialize_config_files || return 1
         fi
 
         # 3.1 初始化中转配置 (配置隔离)
         _init_relay_config
         
-        # 3.2 [关键修复] 清理主配置文件中的旧版残留
-        local config_updated=false
-        if _cleanup_legacy_config; then
-            config_updated=true
-        fi
-        
-        # 3.3 安全迁移旧 DNS；不再将已迁移或自定义 DNS 改回旧模板。
+        # 不再因打开菜单就删除 relay-out-* 或覆盖 route.final，避免破坏自定义出口。
+        # DNS/NTP 迁移有改动且原服务运行时才重启；失败时保留/恢复原配置。
         local dns_fix_rc
         _check_and_fix_dns
         dns_fix_rc=$?
-        if [ "$dns_fix_rc" -eq 0 ]; then
-            config_updated=true
-        elif [ "$dns_fix_rc" -ne 1 ]; then
-            _warn "DNS 自动迁移失败，未应用 DNS 候选配置；可用菜单 [12] 查看合并配置错误。"
+        if [ "$dns_fix_rc" -gt 1 ]; then
+            _warn "DNS 自动迁移未完成。可用菜单 [19] 预检，或 [12] 查看原配置错误。"
         fi
-        
-        if [ "$config_updated" = true ]; then
-            _manage_service restart
-        fi
-        
+
         # [BUG FIX] 检查并修复旧版服务文件
         if [ -f "$SERVICE_FILE" ]; then
             local need_update=false
@@ -6321,18 +6692,53 @@ while [[ $# -gt 0 ]]; do
             exit $?
             ;;
         fix-dns)
-            # 仅 DNS 迁移 + 服务重启；不更新核心、不安装依赖、不重新创建节点。
             _check_root
             _require_singbox || exit 1
-            command -v jq >/dev/null 2>&1 || { _error "请先安装 jq。"; exit 1; }
             _detect_init_system
-            case "$INIT_SYSTEM" in
-                systemd|openrc) ;;
-                *) _error "未检测到 systemd/OpenRC，未执行 DNS 修复。"; exit 1 ;;
-            esac
-            _manage_service restart || exit 1
-            _install_cli_shortcut || _warn "快捷命令未更新，请直接使用此修复脚本。"
-            _success "DNS 迁移及服务重启命令已完成；可用 check-config 复查。"
+            _dns_transaction fix || exit 1
+            _install_cli_shortcut || _warn "快捷命令未更新，请直接使用此脚本。"
+            exit 0
+            ;;
+        dns-preview)
+            _require_singbox || exit 1
+            _dns_transaction preview
+            exit $?
+            ;;
+        dns-status)
+            trap - EXIT
+            _require_singbox || exit 1
+            _dns_status
+            exit $?
+            ;;
+        dns-menu)
+            _check_root
+            _require_singbox || exit 1
+            _detect_init_system
+            _dns_menu
+            exit $?
+            ;;
+        set-dns)
+            _check_root
+            _require_singbox || exit 1
+            [ -n "${2:-}" ] || { _error "用法：set-dns 上游 [keep|ipv4_only|prefer_ipv4|ipv6_only|prefer_ipv6] [引导DNS] [tag]"; exit 1; }
+            _detect_init_system
+            _dns_transaction set "$2" "${3:-keep}" "${4:-local}" "${5:-}"
+            exit $?
+            ;;
+        sync-time)
+            _check_root
+            _sync_system_time
+            exit $?
+            ;;
+        help|--help|-h)
+            trap - EXIT
+            printf '%s\n' "xlddg / bash xldj.sh：管理菜单" \
+                "check-config：只检查实际合并配置，不迁移、不重启" \
+                "dns-preview：生成迁移候选并校验，不替换配置、不重启" \
+                "fix-dns：安全迁移；有变化才重启，没有变化不动服务" \
+                "dns-status / dns-menu：查看 DNS / DNS 管理菜单" \
+                "set-dns 上游 [策略] [引导DNS] [tag]：按 tag 修改上游；默认策略 keep" \
+                "sync-time：检查时间；容器跳过系统校时，独立主机须显式允许"
             exit 0
             ;;
         keepalive)
